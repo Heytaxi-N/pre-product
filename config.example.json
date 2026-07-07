@@ -1,0 +1,22 @@
+{
+  "phone": "",
+  "password": "",
+  "suppliers": {
+    "示例供货商A": "_d____此处填入szwego相册ID____",
+    "示例供货商B": "_d____此处填入szwego相册ID____"
+  },
+  "ai_vision": {
+    "base_url": "https://token.xiaorongtech.com/v1",
+    "api_key": "",
+    "model": "qwen3-vl-flash"
+  },
+  "folder_template": "{img_name}",
+  "feishu": {
+    "app_id": "",
+    "app_secret": "",
+    "base_id": "",
+    "table_id": "",
+    "info_field": "信息",
+    "img_name_field": "图片名"
+  }
+}

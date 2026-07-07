@@ -1,0 +1,23 @@
+# 敏感配置(含密码/密钥)
+config.json
+config.test.json
+
+# 运行时状态
+progress.json
+
+# 生成的预览/确认文件
+分组预览.html
+confirmed_groups.json
+
+# 抓取数据
+scrape*.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Claude Code 本地设置
+.claude/
