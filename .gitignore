@@ -9,6 +9,7 @@ progress.json
 分组预览.html
 confirmed_groups.json
 install_bookmark.html
+paste_to_console.js
 
 # 抓取数据
 scrape*.json

@@ -5,7 +5,7 @@
   # 然后运行:
   SCRAPE_JSON=~/Downloads/scrape.json python3 pick_products.py
 """
-import json, os, sys, time, shutil, base64, hashlib, tempfile
+import json, os, sys, time, shutil, base64, hashlib, tempfile, re
 from pathlib import Path
 from datetime import datetime
 import urllib.request, urllib.parse, urllib.error
@@ -736,6 +736,232 @@ def cmd_preview(config, progress, data, code=""):
     print(f"  然后运行: python3 pick_products.py process ~/Downloads/confirmed_groups.json")
 
 
+def _normalize_date(date_str):
+    """'MM-DD' → 'YYYY-MM-DD' (补当前年份); 已完整则返回."""
+    if len(date_str) == 5 and date_str[2] == "-":
+        return datetime.now().strftime("%Y") + "-" + date_str
+    return date_str
+
+def _data_has_date(scrape_path, config, supplier_name, date_str):
+    """检查 scrape 里指定供货商指定日期是否有内容."""
+    p = Path(scrape_path)
+    if not p.exists():
+        return False
+    try:
+        d = load_scrape(str(p), config)
+    except Exception:
+        return False
+    # 供货商模糊匹配
+    aid = config.get("suppliers", {}).get(supplier_name)
+    if not aid:
+        for n, a in config["suppliers"].items():
+            if supplier_name in n:
+                aid = a; break
+    if not aid or aid not in d:
+        return False
+    for it in d[aid].get("items", []):
+        if _item_date(it) == date_str:
+            return True
+    return False
+
+def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
+    """深挖来的单供货商 JSON merge 到主 scrape_all.json.
+    anchor 格式: {"supplier":.., "albumId":.., "items":[..]}
+    """
+    anchor = json.loads(Path(anchor_json_path).read_text())
+    aid = anchor.get("albumId"); items = anchor.get("items", [])
+    if not aid:
+        return False
+    if Path(scrape_path).exists():
+        raw = json.loads(Path(scrape_path).read_text())
+        if not (isinstance(raw, dict) and "data" in raw):
+            raw = {"data": {}}
+    else:
+        raw = {"data": {}}
+    # 已有该 aid 的 items 按 goods_id 去重合并
+    existing = raw["data"].get(aid, {"supplier": anchor.get("supplier", ""), "items": []})
+    seen = {it["goods_id"] for it in existing["items"]}
+    for it in items:
+        if it["goods_id"] not in seen:
+            existing["items"].append(it); seen.add(it["goods_id"])
+    existing["supplier"] = anchor.get("supplier") or existing.get("supplier", "")
+    raw["data"][aid] = existing
+    Path(scrape_path).write_text(json.dumps(raw, ensure_ascii=False, indent=2))
+    return True
+
+
+def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240):
+    """前置: 确保 scrape 里有 supplier_name 在 date_str 的数据. 缺失则打开带 anchor 参数的 szwego,
+    让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
+    merge 到本地 scrape_all.json 后再验证.
+    """
+    if _data_has_date(scrape_path, config, supplier_name, date_str):
+        return True
+    print(f"⚠ 本地数据没有 「{supplier_name}」 {date_str} 的内容, 帮你去深挖...")
+    # 打开带 anchor 参数的 szwego, 书签会读 URL 参数决定行为
+    # 参数放 hash 前 (search), 否则 vue router 匹配失败白屏
+    anchor_url = (
+        "https://www.szwego.com/static/index.html"
+        f"?anchor_supplier={urllib.parse.quote(supplier_name)}"
+        f"&anchor_date={date_str}"
+        "#/album_home"
+    )
+    try:
+        import webbrowser
+        webbrowser.open(anchor_url)
+    except Exception:
+        pass
+    print(f"  🌐 已打开微购相册 (URL 含 anchor 参数)")
+    print(f"  👆 请点浏览器书签栏的「🛒 抓挑品数据」")
+    print(f"     还没装/需要更新书签: 另开终端跑 python3 pick_products.py bookmark")
+    print(f"  ⏳ 监听下载... (最长 {timeout} 秒, Ctrl+C 取消)")
+
+    downloads = Path.home() / "Downloads"
+    anchor_dl = downloads / "scrape_anchor.json"
+    all_dl = Path(scrape_path)
+    # 记录开始时刻, 忽略更早的旧文件
+    start_ts = time.time() - 1
+    all_dl_orig_mtime = all_dl.stat().st_mtime if all_dl.exists() else 0
+
+    try:
+        end = time.time() + timeout
+        while time.time() < end:
+            time.sleep(1)
+            # 优先看 anchor 深挖
+            if anchor_dl.exists() and anchor_dl.stat().st_mtime > start_ts:
+                s1 = anchor_dl.stat().st_size; time.sleep(0.5)
+                if anchor_dl.stat().st_size != s1: continue
+                print(f"  ⇣ 收到深挖数据: {anchor_dl}")
+                if _merge_anchor_into_scrape(scrape_path, anchor_dl):
+                    anchor_dl.unlink()  # 用完删掉
+                    if _data_has_date(scrape_path, config, supplier_name, date_str):
+                        print("✓ merge 后已含目标日期数据")
+                        return True
+                    else:
+                        print(f"⚠ 深挖翻完了仍没抓到 {date_str}(供货商可能真没在这天上新)")
+                        return False
+            # 兼容: 用户点了普通书签(不带 anchor 参数抓的全量)
+            if all_dl.exists() and all_dl.stat().st_mtime > all_dl_orig_mtime and all_dl.stat().st_mtime > start_ts:
+                s1 = all_dl.stat().st_size; time.sleep(0.5)
+                if all_dl.stat().st_size != s1: continue
+                if _data_has_date(scrape_path, config, supplier_name, date_str):
+                    print("✓ 全量数据里有目标日期")
+                    return True
+                else:
+                    print(f"⚠ 全量抓完仍没有 {date_str}, 请点带深挖的书签(URL 里带 anchor 参数)")
+                    all_dl_orig_mtime = all_dl.stat().st_mtime  # 记录已看过
+    except KeyboardInterrupt:
+        print("\n已取消")
+    print("超时"); return False
+
+
+def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
+    """锚点定向: 供货商 + 日期 + title 含关键词 → 找到匹配条目 → 前后到占位图为止 → 处理.
+    不推进进度.
+    date_str 支持 'MM-DD' 或 'YYYY-MM-DD'. 前者补当前年份.
+    """
+    # 1. 定位供货商
+    suppliers = config.get("suppliers", {})
+    aid = suppliers.get(supplier_name)
+    if not aid:
+        # 尝试模糊匹配
+        for n, a in suppliers.items():
+            if supplier_name in n:
+                supplier_name, aid = n, a; break
+    if not aid:
+        print(f"❌ 供货商 「{supplier_name}」 未在 config.json 里配置"); return
+    if aid not in data or not data[aid].get("items"):
+        print(f"❌ 抓取数据里没有 「{supplier_name}」 的内容"); return
+
+    # 2. 日期规范化
+    if len(date_str) == 5 and date_str[2] == "-":
+        date_str = datetime.now().strftime("%Y") + "-" + date_str
+    print(f"锚点定位: 供货商={supplier_name} 日期={date_str} 关键词=「{keyword}」")
+
+    # 3. 该日期条目, 按时间升序
+    day_items = sorted(
+        [it for it in data[aid]["items"] if _item_date(it) == date_str],
+        key=lambda x: x["time_stamp"])
+    if not day_items:
+        print(f"❌ 该日期无内容"); return
+    print(f"  当日 {len(day_items)} 帖")
+
+    # 4. 找匹配锚点
+    matched_ids = {it["goods_id"] for it in day_items if keyword in (it.get("title") or "")}
+    if not matched_ids:
+        print(f"❌ 没有 title 含「{keyword}」的条目"); return
+    print(f"  匹配锚点 {len(matched_ids)} 条")
+
+    # 5. 从每个锚点向前/向后扩展, 遇占位图停. 只对锚点邻域调 AI, 省 token.
+    ai_cfg = config.get("ai_vision") or {}
+    cache_dir = TMP_ROOT / f"anchor_{aid[-8:]}"
+    matched_indices = [i for i, it in enumerate(day_items) if it["goods_id"] in matched_ids]
+
+    ph_cache = {}  # idx -> bool, 结果缓存, 避免重复调用
+    ai_calls = [0]
+    def is_ph(idx):
+        if idx in ph_cache:
+            return ph_cache[idx]
+        ai_calls[0] += 1
+        r = _is_placeholder(ai_cfg, day_items[idx], cache_dir)
+        ph_cache[idx] = r
+        return r
+
+    print(f"  从锚点向前/向后扩展 (只对邻域调 AI)...")
+    visited = set()
+    target_segs = []
+    for anchor_idx in matched_indices:
+        if anchor_idx in visited:
+            continue
+        # 向前扩展
+        left = anchor_idx
+        while left - 1 >= 0 and left - 1 not in visited and not is_ph(left - 1):
+            left -= 1
+        # 向后扩展
+        right = anchor_idx
+        while right + 1 < len(day_items) and right + 1 not in visited and not is_ph(right + 1):
+            right += 1
+        seg = [day_items[i] for i in range(left, right + 1)]
+        target_segs.append(seg)
+        for i in range(left, right + 1):
+            visited.add(i)
+        print(f"    锚点 #{anchor_idx} → 段 [{left}..{right}] ({right-left+1} 帖)")
+
+    total_posts = sum(len(s) for s in target_segs)
+    print(f"  切段后: {len(target_segs)} 段, 共 {total_posts} 帖 (AI 调用 {ai_calls[0]} 次, 对比全扫 {len(day_items)} 次)")
+
+    # 6. 每段内部再跑 AI 图文分组成产品
+    all_groups = []
+    for seg in target_segs:
+        if len(seg) == 1:
+            all_groups.append(seg); continue
+        cur = [[seg[0]]]
+        for cur_it in seg[1:]:
+            prev = cur[-1][-1]
+            gap = (cur_it["time_stamp"] - prev["time_stamp"]) / 1000
+            if gap <= GROUP_MAX_GAP and _ai_same_product(ai_cfg, prev, cur_it, cache_dir):
+                cur[-1].append(cur_it)
+            else:
+                cur.append([cur_it])
+        all_groups.extend(cur)
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    print(f"  → 分成 {len(all_groups)} 个产品:")
+    for gi, g in enumerate(all_groups, 1):
+        titles = " / ".join((it.get("title") or "").replace("\n", " ")[:15] for it in g)
+        anchor_mark = " 🎯" if any(it["goods_id"] in matched_ids for it in g) else ""
+        print(f"    产品{gi}{anchor_mark}: {len(g)}帖 — {titles[:60]}")
+
+    # 7. 处理
+    fs_cfg = config.get("feishu") or {}
+    feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    n = process_groups(supplier_name, aid, all_groups, progress, feishu, fs_cfg, ai_cfg,
+                       advance_progress=False)
+    print(f"\n{'='*50}\n✓ 锚点定向完成, 处理 {n} 个产品 (未推进进度)")
+
+
 def cmd_process_confirmed(config, progress, confirmed_path):
     """按确认后的分组处理."""
     confirmed = json.loads(Path(confirmed_path).read_text())
@@ -785,25 +1011,53 @@ def cmd_install_bookmark(config):
     # 书签的 javascript: URL — 编码为 URI 保证在 href 里合法
     bookmarklet_body = r"""(async()=>{
 const SUP=__SUPPLIERS__;
+const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,videoUrl:it.videoUrl||it.videoURL||''});
+const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id).map(clean);
+const fetchOne=async(aid,pageTs,dateFilter)=>{
+  const ds=dateFilter||'';const de=dateFilter||'';
+  const u='https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate='+ds+'&endDate='+de+'&sourceId=&requestDataType='+(pageTs?'&slipType=1&timestamp='+pageTs:'');
+  const r=await fetch(u,{method:'POST'});return await r.json();
+};
+const dl=(data,fname)=>{
+  const blob=new Blob([JSON.stringify(data)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fname;
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
+};
+const params=new URLSearchParams(location.search);
+const anchorSup=params.get('anchor_supplier');
+const anchorDate=params.get('anchor_date');
+if(anchorSup&&anchorDate){
+  let aid=null,name=anchorSup;
+  for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
+  if(!aid){alert('未找到供货商: '+anchorSup);return;}
+  const all=[];let pageTs='',pages=0;const MAX=15;
+  while(pages<MAX){
+    let d;try{d=await fetchOne(aid,pageTs,anchorDate);}catch(e){break;}
+    const items=filt(d.result&&d.result.items?d.result.items:[]);
+    if(items.length===0)break;
+    all.push(...items);pages++;
+    if(!d.result.pagination||!d.result.pagination.isLoadMore)break;
+    pageTs=d.result.pagination.pageTimestamp;
+    await new Promise(r=>setTimeout(r,150));
+  }
+  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,pages}},'scrape_anchor.json');
+  alert('深挖完成: '+name+' '+anchorDate+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
+  return;
+}
 const out={data:{}};let ok=0,err=0;
 for(const [name,aid] of Object.entries(SUP)){
-  try{
-    const r=await fetch('https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate=&endDate=&sourceId=&requestDataType=',{method:'POST'});
-    const d=await r.json();
-    const items=(d.result&&d.result.items?d.result.items:[])
-      .filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id)
-      .map(it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,videoUrl:it.videoUrl||it.videoURL||''}));
-    out.data[aid]={supplier:name,items};ok++;
-  }catch(e){out.data[aid]={supplier:name,items:[]};err++;}
+  try{const d=await fetchOne(aid,'','');out.data[aid]={supplier:name,items:filt(d.result&&d.result.items?d.result.items:[])};ok++;}
+  catch(e){out.data[aid]={supplier:name,items:[]};err++;}
   await new Promise(r=>setTimeout(r,200));
 }
-const blob=new Blob([JSON.stringify(out)],{type:'application/json'});
-const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='scrape_all.json';
-document.body.appendChild(a);a.click();document.body.removeChild(a);
-alert('抓取完成: '+ok+' 个成功, '+err+' 个失败\n已下载 scrape_all.json 到 Downloads');
+dl(out,'scrape_all.json');
+alert('抓取完成: '+ok+' 成功, '+err+' 失败\n下载 scrape_all.json');
 })();"""
+    # 展开成一行: 先剥除 // 行注释(它们展开成一行后会吃掉后面所有代码), 再把 \n 换成空格
+    _body = bookmarklet_body.replace("__SUPPLIERS__", suppliers_js)
+    _body = "\n".join(re.sub(r"//.*$", "", ln) for ln in _body.split("\n"))
     bookmarklet = "javascript:" + urllib.parse.quote(
-        bookmarklet_body.replace("__SUPPLIERS__", suppliers_js).replace("\n", " "),
+        _body.replace("\n", " "),
         safe="():;,{}[]=/|&+.*!$?~"   # 不含 " ' 让它们变 %22 %27, 保证 HTML 属性安全
     )
     html = """<!DOCTYPE html><meta charset="utf-8">
@@ -817,23 +1071,39 @@ h1{font-size:20px}
 code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:13px}
 </style>
 <h1>📦 挑品抓取书签</h1>
-<p><b>拖下面这个蓝色按钮到浏览器书签栏</b>(不要点它):</p>
+<p><b>把下面这个蓝色按钮 <em style="color:#d32f2f">拖</em>(不是点)到书签栏</b>:</p>
 <p><a class="btn" href="__HREF__">🛒 抓挑品数据</a></p>
 <div class="steps">
 <b>使用方法:</b>
 <ol>
-<li>登录微购相册网页版 <code>https://www.szwego.com/static/index.html</code></li>
-<li>随便进一个页面(相册动态即可)</li>
-<li>点书签栏里的「🛒 抓挑品数据」</li>
-<li>等几秒 → 自动下载 <code>scrape_all.json</code> 到 Downloads</li>
+<li>登录微购相册 <code>https://www.szwego.com/static/index.html</code></li>
+<li>在书签栏点「🛒 抓挑品数据」</li>
+<li>自动下载 <code>scrape_all.json</code> 到 Downloads</li>
 <li>回终端跑 <code>python3 pick_products.py</code></li>
 </ol>
 </div>
-<p style="color:#666;font-size:13px">书签内置了 config.json 里配的 __N__ 个供货商。以后加了新供货商,重新生成书签即可。</p>
+<div class="steps" style="background:#fff3e0">
+<b>🆘 兜底方案(书签点了没反应):</b>
+<ol>
+<li>登录 szwego 页面</li>
+<li>按 <code>F12</code> 打开开发者工具 → 切到 Console 标签</li>
+<li>打开 <code>paste_to_console.js</code>(在挑品脚本目录),全选复制内容</li>
+<li>粘贴到 console,按回车 → 自动下载</li>
+</ol>
+<p style="font-size:13px;color:#666">兜底方案不需要装书签,一次性用完</p>
+</div>
+<p style="color:#666;font-size:13px">书签内置了 config.json 里配的 __N__ 个供货商。加了新供货商,重跑一次 <code>bookmark</code>。</p>
 """
     html = html.replace("__HREF__", bookmarklet).replace("__N__", str(len(config.get("suppliers", {}))))
     BOOKMARKLET_FILE.write_text(html, encoding="utf-8")
+    # 兜底: 生成一段可直接粘贴 console 的 JS
+    console_js = (
+        "// === 粘贴到 szwego 页面的 devtools console 里跑 ===\n"
+        + bookmarklet_body.replace("__SUPPLIERS__", suppliers_js).replace("alert(", "console.log(")
+    )
+    (SCRIPT_DIR / "paste_to_console.js").write_text(console_js, encoding="utf-8")
     print(f"✓ 书签安装页已生成: {BOOKMARKLET_FILE}")
+    print(f"✓ 兜底 console 脚本: {SCRIPT_DIR / 'paste_to_console.js'}")
     try:
         import webbrowser
         webbrowser.open(BOOKMARKLET_FILE.as_uri())
@@ -854,10 +1124,11 @@ def main():
     # 位置参数: [mode] [供货商] [编码]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
     mode = ""
-    if positional and positional[0] in ("preview", "process", "run", "bookmark"):
+    if positional and positional[0] in ("preview", "process", "run", "bookmark", "anchor"):
         mode = positional.pop(0)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
     code_arg = positional[1] if len(positional) >= 2 else ""
+    date_arg = positional[2] if len(positional) >= 3 else ""  # anchor 专用
 
     supplier = supplier_arg or os.environ.get("SUPPLIERS", "")
     code = code_arg or os.environ.get("CODE", "")
@@ -889,6 +1160,16 @@ def main():
         print(f"   还没装书签? 运行: python3 pick_products.py bookmark"); sys.exit(1)
     print(f"读取抓取数据: {scrape_path}")
     data = load_scrape(scrape_path, config)
+
+    # anchor: 锚点定向 (前置检查数据源, 缺失自动引导抓取)
+    if mode == "anchor":
+        if not (supplier_arg and code_arg and date_arg):
+            print("用法: python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD或YYYY-MM-DD>"); sys.exit(1)
+        norm_date = _normalize_date(date_arg)
+        if not ensure_data_for_date(scrape_path, config, supplier_arg, norm_date):
+            print(f"❌ 未获取到 {norm_date} 的数据, 无法继续"); return
+        data = load_scrape(scrape_path, config)  # 重抓后重新加载
+        cmd_anchor(config, progress, data, supplier_arg, code_arg, date_arg); return
 
     # run: 显式跳过预览(自动化用)
     if mode == "run":

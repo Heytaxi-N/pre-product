@@ -51,7 +51,7 @@ python3 pick_products.py
 
 ## 高级用法
 
-### 定向下载
+### 定向下载(按编码筛)
 
 只处理某供货商、文案含某编码的素材:
 
@@ -61,13 +61,34 @@ python3 pick_products.py run 晨星外贸06 0708d
 
 定向模式**不推进进度**,下次跑仍能拿到这批。
 
+### 锚点定向(找某天某关键词素材,前后到占位图为止)
+
+```bash
+python3 pick_products.py anchor 南在南方 凯乐石女款裙裤 04-30
+```
+
+流程:
+1. 检查本地是否有 南在南方 04-30 的数据
+2. **没有**就自动打开 szwego 页面(URL 里带 anchor 参数),提示你点书签
+3. 书签识别 URL 参数,进入**深挖模式**:用接口的 `startDate`/`endDate` 直接查询该天,自动翻页拿全,下载 `scrape_anchor.json`
+4. 脚本自动 merge 到本地 `scrape_all.json`
+5. 从匹配"凯乐石女款裙裤"的锚点条目,**向前/向后扩展直到遇到占位图**(只对锚点邻域调 AI,不全扫)
+6. 段内 AI 分组成产品 → 下载 → 分类 → 写飞书 → 建文件夹
+
+不推进进度。
+
 ### 单独入口(给自动化脚本用)
 
-- `python3 pick_products.py bookmark` — 生成/更新书签安装页
+- `python3 pick_products.py bookmark` — 生成/更新书签安装页 + 兜底 console 脚本
 - `python3 pick_products.py run [供货商] [编码]` — 直接跑,不弹预览
+- `python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD>` — 锚点定向
 - `python3 pick_products.py process <confirmed.json>` — 只处理已确认的分组文件
 
 环境变量:`SUPPLIERS=`、`CODE=`、`MAX_PRODUCTS=`、`SCRAPE_JSON=`。
+
+### 书签点了没反应?兜底方案
+
+`bookmark` 命令会同时生成 `paste_to_console.js`。打开 szwego 页面 → 按 F12 → Console 标签 → 粘贴脚本内容 → 回车,一次性抓完,不用装书签。
 
 ## 进度记录
 
