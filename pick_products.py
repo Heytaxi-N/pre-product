@@ -1105,12 +1105,11 @@ for(const [name,aid] of Object.entries(SUP)){
 dl(out,'scrape_all.json');
 alert('抓取完成: '+ok+' 成功, '+err+' 失败\n下载 scrape_all.json');
 })();"""
-    # 展开成一行: 先剥除 // 行注释(它们展开成一行后会吃掉后面所有代码), 再把 \n 换成空格
+    # 展开成一行; 不剥除 //, 否则会截断 https:// 这类字符串。
     _body = bookmarklet_body.replace("__SUPPLIERS__", suppliers_js)
-    _body = "\n".join(re.sub(r"//.*$", "", ln) for ln in _body.split("\n"))
     bookmarklet = "javascript:" + urllib.parse.quote(
         _body.replace("\n", " "),
-        safe="():;,{}[]=/|&+.*!$?~"   # 不含 " ' 让它们变 %22 %27, 保证 HTML 属性安全
+        safe="():;,{}[]=/|+.*!$?~"   # 不含 " ' &，保证 HTML 属性安全
     )
     html = """<!DOCTYPE html><meta charset="utf-8">
 <title>安装挑品抓取书签</title>
