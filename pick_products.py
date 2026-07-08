@@ -43,17 +43,29 @@ def http_get_json(url, headers=None):
 # ── 产品分组 (AI 图文判断) ───────────────────────────
 GROUP_MAX_GAP = 1800  # 秒: 间隔超过此值直接判为不同产品(省 AI 调用)
 
+_VIDEO_EXT = (".mp4", ".mov", ".avi", ".webm", ".mkv")
+
+def _looks_like_image(url):
+    """URL 是否可当作图片: 非视频扩展名, 或视频扩展名但带七牛云截帧参数(?vframe/jpg/...)"""
+    path = url.split("?")[0].lower()
+    if not path.endswith(_VIDEO_EXT):
+        return True
+    return "vframe" in url and "jpg" in url  # 视频截帧
+
 def _ensure_first_image(item, cache_dir):
-    """下载帖子第一张图到缓存, 返回路径 (按 goods_id 缓存, 避免重复下)."""
+    """下载帖子第一张真实图片(跳过纯视频, 允许视频截帧)到缓存. 全无可用则返回 None."""
     imgs = item.get("imgsSrc") or []
-    if not imgs:
+    img_url = next((u for u in imgs if _looks_like_image(u)), None)
+    if not img_url:
         return None
     cache_dir.mkdir(parents=True, exist_ok=True)
-    url = imgs[0].split("?")[0]
-    dest = cache_dir / f"{item['goods_id'][-10:]}{Path(url).suffix or '.jpg'}"
+    # 下载用完整 URL (保留 ?vframe 参数才能拿到截帧); 缓存名统一 .jpg 避免 mp4 后缀误导
+    is_vframe = "vframe" in img_url
+    ext = ".jpg" if is_vframe else (Path(img_url.split("?")[0]).suffix or ".jpg")
+    dest = cache_dir / f"{item['goods_id'][-10:]}{ext}"
     if not dest.exists():
         try:
-            dest.write_bytes(http_get_bytes(url))
+            dest.write_bytes(http_get_bytes(img_url if is_vframe else img_url.split("?")[0]))
         except Exception:
             return None
     return dest
@@ -74,9 +86,14 @@ def _ai_same_product(ai_cfg, a, b, cache_dir):
     ta = (a.get("title") or "").replace("\n", " ")[:120]
     tb = (b.get("title") or "").replace("\n", " ")[:120]
     prompt = (
-        "下面是微商相册里两个相邻帖子的主图和文案。判断它们是否属于【同一件商品】。\n"
-        "同一件商品的判定: 同一款(可不同颜色/不同角度)、或其中一个是这件商品的价格图/尺码表/模特图/细节图。\n"
-        "不同商品的判定: 明显是两种不同品类或不同款式的货。\n"
+        "下面是微商相册里两个帖子的主图和文案。判断它们是否属于【完全同一件商品SKU】。\n"
+        "严格标准 — 同一件商品必须满足:\n"
+        "  1) 品牌一致 (如都是凯乐石/都是lululemon)\n"
+        "  2) 品类完全一致 (裙裤 vs 短裤 vs 长裤 vs 上衣 — 不能混)\n"
+        "  3) 性别/受众一致 (男款/女款/男女同款 — 不能混)\n"
+        "  4) 款式/系列一致 (同一版型或同一系列, 如都是'户外速干裙裤系列')\n"
+        "只有全部满足才算同一件商品(允许不同颜色/角度/是价格图/尺码表/模特图/细节图/面料介绍)。\n"
+        "只要有一条不满足(比如都是凯乐石运动裤但一个男款短裤一个女款裙裤), 判为不同商品。\n"
         f"帖子A文案: {ta}\n帖子B文案: {tb}\n"
         "只回复一个字: 是 或 否"
     )
@@ -94,15 +111,23 @@ def _ai_same_product(ai_cfg, a, b, cache_dir):
         return False
 
 def _is_placeholder(ai_cfg, item, cache_dir):
-    """AI 判断某帖主图是否为'与服装无关的占位/分割图'. 失败保守返回 False."""
+    """判断某帖是否'与服装无关的占位/分割图'.
+    结构性前置: 必须 1 图 + 空文案. 不满足 → 一定不是占位图, 直接 False (免 AI 调用).
+    满足后再用 AI 视觉确认是不是"与服装无关".
+    三态返回: True 占位 / False 商品 / None 调用失败.
+    """
+    imgs = item.get("imgsSrc") or []
+    title = (item.get("title") or "").strip()
+    if len(imgs) != 1 or title:
+        return False  # 结构不符 → 一定不是占位, 免 AI
     base_url = (ai_cfg or {}).get("base_url", "").rstrip("/")
     api_key = (ai_cfg or {}).get("api_key", "")
     model = (ai_cfg or {}).get("model", "qwen3-vl-flash")
     if not (base_url and api_key):
-        return False
+        return None
     ip = _ensure_first_image(item, cache_dir)
     if not ip:
-        return False
+        return None
     mime = "image/png" if ip.suffix.lower() == ".png" else "image/jpeg"
     durl = f"data:{mime};base64,{base64.b64encode(ip.read_bytes()).decode()}"
     prompt = (
@@ -116,13 +141,21 @@ def _is_placeholder(ai_cfg, item, cache_dir):
         {"type": "image_url", "image_url": {"url": durl}},
         {"type": "text", "text": prompt},
     ]}]}
-    try:
-        resp = http_post_json(f"{base_url}/chat/completions", payload,
-                              headers={"Authorization": f"Bearer {api_key}"})
-        ans = resp["choices"][0]["message"]["content"].strip()
-        return "占位" in ans[:4]
-    except Exception:
-        return False
+    # 偶发抖动/限流 → 重试, 每次退避递增. 全失败才 return None
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = http_post_json(f"{base_url}/chat/completions", payload,
+                                  headers={"Authorization": f"Bearer {api_key}"})
+            ans = resp["choices"][0]["message"]["content"].strip()
+            return "占位" in ans[:4]
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                print(f"    ⚠ AI 调用失败 (第{attempt+1}次): {str(e)[:80]}, 等 {(attempt+1)*0.8:.1f}s 后重试")
+                time.sleep((attempt + 1) * 0.8)
+    print(f"    ❌ 重试 3 次仍失败: {str(last_err)[:100]}")
+    return None
 
 def group_products_ai(ai_cfg, items, cache_dir):
     """先用占位图(分割线)切硬边界并剔除占位帖; 段内再跑相邻 AI 图文分组.
@@ -892,58 +925,77 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
         print(f"❌ 没有 title 含「{keyword}」的条目"); return
     print(f"  匹配锚点 {len(matched_ids)} 条")
 
-    # 5. 从每个锚点向前/向后扩展, 遇占位图停. 只对锚点邻域调 AI, 省 token.
+    # 5. 白图切段 + 从锚点段合并后续同款段.
+    #    用户模型: 一个产品被两张白色占位图(1图+空文案)包起来. 锚点是产品引流预告帖,
+    #    后面白图分隔了引流与正片, 再后面段是详情/展示. 只要下一段的代表帖跟锚点同款,
+    #    就合并; 直到某段代表帖不同款为止.
     ai_cfg = config.get("ai_vision") or {}
+    if not (ai_cfg.get("base_url") and ai_cfg.get("api_key")):
+        print("❌ 未配置 ai_vision, 无法进行 AI 同款判定"); return
     cache_dir = TMP_ROOT / f"anchor_{aid[-8:]}"
     matched_indices = [i for i, it in enumerate(day_items) if it["goods_id"] in matched_ids]
 
-    ph_cache = {}  # idx -> bool, 结果缓存, 避免重复调用
-    ai_calls = [0]
-    def is_ph(idx):
-        if idx in ph_cache:
-            return ph_cache[idx]
-        ai_calls[0] += 1
-        r = _is_placeholder(ai_cfg, day_items[idx], cache_dir)
-        ph_cache[idx] = r
-        return r
+    MAX_MERGE_SEGS = 5  # 最多向后合并的段数(每段 1 次 AI 判定)
 
-    print(f"  从锚点向前/向后扩展 (只对邻域调 AI)...")
+    def _is_struct_placeholder(item):
+        """结构性占位: 1 图 + 空文案. 用户明确指出这是白色占位图特征."""
+        imgs = item.get("imgsSrc") or []
+        title = (item.get("title") or "").strip()
+        return len(imgs) == 1 and not title
+
+    # 5a. 用结构性白图切当日成段(白图本身不属于任何段)
+    placeholders = {i for i, it in enumerate(day_items) if _is_struct_placeholder(it)}
+    segments = []
+    cur = []
+    for i in range(len(day_items)):
+        if i in placeholders:
+            if cur: segments.append(cur); cur = []
+        else:
+            cur.append(i)
+    if cur: segments.append(cur)
+    print(f"  当日按白图切成 {len(segments)} 段, 白图 {len(placeholders)} 张")
+
+    # 5b. 找每个锚点所在段, 合并锚点 + 后续同款段
     visited = set()
     target_segs = []
+    ai_calls = [0]
     for anchor_idx in matched_indices:
-        if anchor_idx in visited:
+        if anchor_idx in visited: continue
+        anchor_it = day_items[anchor_idx]
+        # 找锚点所在段的编号
+        seg_i = next((i for i, seg in enumerate(segments) if anchor_idx in seg), None)
+        if seg_i is None:
+            # 锚点自己是白图? 罕见, 跳过
+            target_segs.append([anchor_it])
+            visited.add(anchor_idx)
             continue
-        # 向前扩展
-        left = anchor_idx
-        while left - 1 >= 0 and left - 1 not in visited and not is_ph(left - 1):
-            left -= 1
-        # 向后扩展
-        right = anchor_idx
-        while right + 1 < len(day_items) and right + 1 not in visited and not is_ph(right + 1):
-            right += 1
-        seg = [day_items[i] for i in range(left, right + 1)]
-        target_segs.append(seg)
-        for i in range(left, right + 1):
-            visited.add(i)
-        print(f"    锚点 #{anchor_idx} → 段 [{left}..{right}] ({right-left+1} 帖)")
+
+        collected_idxs = [anchor_idx]  # 先只放锚点自己(锚点段里其他帖可能是别的产品)
+        merged_segs = [seg_i]
+
+        # 向后合并: Sk+1, Sk+2, ..., 每段用第一帖跟锚点比是否同款
+        for next_i in range(seg_i + 1, min(seg_i + 1 + MAX_MERGE_SEGS, len(segments))):
+            next_seg = segments[next_i]
+            first_it = day_items[next_seg[0]]
+            ai_calls[0] += 1
+            time.sleep(0.15)
+            if _ai_same_product(ai_cfg, anchor_it, first_it, cache_dir):
+                collected_idxs.extend(next_seg)
+                merged_segs.append(next_i)
+            else:
+                break  # 不同款: 停止合并
+
+        collected_idxs.sort()
+        seg_items = [day_items[i] for i in collected_idxs]
+        target_segs.append(seg_items)
+        for i in collected_idxs: visited.add(i)
+        print(f"    锚点 #{anchor_idx} (段 S{seg_i}) → 合并段 {merged_segs}, 共 {len(collected_idxs)} 帖 idxs={collected_idxs}")
 
     total_posts = sum(len(s) for s in target_segs)
-    print(f"  切段后: {len(target_segs)} 段, 共 {total_posts} 帖 (AI 调用 {ai_calls[0]} 次, 对比全扫 {len(day_items)} 次)")
+    print(f"  合并完: {len(target_segs)} 段, 共 {total_posts} 帖 (AI 调用 {ai_calls[0]} 次, 对比全扫 {len(day_items)} 次)")
 
-    # 6. 每段内部再跑 AI 图文分组成产品
-    all_groups = []
-    for seg in target_segs:
-        if len(seg) == 1:
-            all_groups.append(seg); continue
-        cur = [[seg[0]]]
-        for cur_it in seg[1:]:
-            prev = cur[-1][-1]
-            gap = (cur_it["time_stamp"] - prev["time_stamp"]) / 1000
-            if gap <= GROUP_MAX_GAP and _ai_same_product(ai_cfg, prev, cur_it, cache_dir):
-                cur[-1].append(cur_it)
-            else:
-                cur.append([cur_it])
-        all_groups.extend(cur)
+    # 6. 每段 = 1 个产品 (白图切段 + 同款合并已确认段内全是同一件商品的素材, 不再拆)
+    all_groups = target_segs
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
 
