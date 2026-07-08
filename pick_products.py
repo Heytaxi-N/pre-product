@@ -664,12 +664,29 @@ renderFlat();
     out_path.write_text(html, encoding="utf-8")
 
 
+def list_available(data, progress, code=""):
+    """返回真实待处理的供货商: [(name, aid, 新增条数), ...]
+    定向模式(code 非空)按编码筛全量; 否则按进度筛新的. 只列有内容的.
+    """
+    out = []
+    for aid, b in data.items():
+        items = b.get("items", [])
+        if not items:
+            continue
+        if code:
+            n = sum(1 for it in items if code in (it.get("title") or ""))
+        else:
+            n = len(filter_new_items(aid, items, progress))
+        if n > 0:
+            out.append((b.get("supplier", aid[-8:]), aid, n))
+    return out
+
+
 def cmd_preview(config, progress, data, code=""):
     """生成分组预览 HTML. code 非空 = 定向: 按编码筛全部条目, 不看进度."""
-    available = [(b.get("supplier", aid[-8:]), aid, len(b.get("items", [])))
-                 for aid, b in data.items() if b.get("items")]
+    available = list_available(data, progress, code)
     if not available:
-        print("没有内容"); return
+        print("没有新内容"); return
     chosen = select_suppliers(available)
     if not chosen:
         print("未选择"); return
@@ -875,10 +892,9 @@ def main():
 
     # run: 显式跳过预览(自动化用)
     if mode == "run":
-        available = [(b.get("supplier", aid[-8:]), aid, len(b.get("items", [])))
-                     for aid, b in data.items() if b.get("items")]
+        available = list_available(data, progress, code)
         if not available:
-            print("抓取数据里没有任何供货商内容"); return
+            print("✓ 没有新内容(所有供货商都已处理到最新)"); return
         chosen = select_suppliers(available)
         if not chosen:
             print("未选择任何供货商, 退出"); return
