@@ -11,6 +11,9 @@
     "model": "qwen3-vl-flash"
   },
   "folder_template": "{img_name}",
+  "defaults": {
+    "max_products": 0
+  },
   "feishu": {
     "app_id": "",
     "app_secret": "",

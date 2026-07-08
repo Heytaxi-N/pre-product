@@ -15,7 +15,8 @@ CONFIG_FILE = SCRIPT_DIR / (sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].end
 PROGRESS_FILE = SCRIPT_DIR / "progress.json"
 OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
 TMP_ROOT = Path(tempfile.gettempdir()) / "weidian_pick"  # 临时/缓存, 不落在商品图里
-MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限
+MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 config.json 里配 defaults.max_products
+BOOKMARKLET_FILE = SCRIPT_DIR / "install_bookmark.html"
 GROUP_TIME_GAP = 120  # 秒: 帖子时间间隔 < 此值归为同一产品
 
 
@@ -733,62 +734,183 @@ def cmd_process_confirmed(config, progress, confirmed_path):
     print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
 
 
+def wait_for_confirmed(watch_dir=None, timeout=600):
+    """监听 Downloads 目录, 等 confirmed_groups.json 出现. 返回路径或 None(超时/取消)."""
+    watch_dir = watch_dir or (Path.home() / "Downloads")
+    target = watch_dir / "confirmed_groups.json"
+    # 忽略比启动更早的旧文件
+    start_ts = time.time() - 1
+    print(f"\n⏳ 等浏览器里点「确认并下载」... (最长 {timeout} 秒, Ctrl+C 退出)")
+    print(f"   监听: {target}")
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            if target.exists() and target.stat().st_mtime > start_ts:
+                # 稳定性: 等文件写完 (大小连续 2 次一致)
+                s1 = target.stat().st_size
+                time.sleep(0.5)
+                if target.stat().st_size == s1 and s1 > 0:
+                    return target
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n已取消等待"); return None
+    print("\n⚠ 超时未收到确认文件"); return None
+
+
+def _load_all_supplier_ids(config):
+    """把 config.suppliers 展开成 JS 字面量字符串, 用于生成书签."""
+    return json.dumps(config.get("suppliers", {}), ensure_ascii=False)
+
+
+def cmd_install_bookmark(config):
+    """生成一个 HTML, 你拖里面的按钮到浏览器书签栏即可."""
+    suppliers_js = _load_all_supplier_ids(config)
+    # 书签的 javascript: URL — 编码为 URI 保证在 href 里合法
+    bookmarklet_body = r"""(async()=>{
+const SUP=__SUPPLIERS__;
+const out={data:{}};let ok=0,err=0;
+for(const [name,aid] of Object.entries(SUP)){
+  try{
+    const r=await fetch('https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate=&endDate=&sourceId=&requestDataType=',{method:'POST'});
+    const d=await r.json();
+    const items=(d.result&&d.result.items?d.result.items:[])
+      .filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id)
+      .map(it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,videoUrl:it.videoUrl||it.videoURL||''}));
+    out.data[aid]={supplier:name,items};ok++;
+  }catch(e){out.data[aid]={supplier:name,items:[]};err++;}
+  await new Promise(r=>setTimeout(r,200));
+}
+const blob=new Blob([JSON.stringify(out)],{type:'application/json'});
+const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='scrape_all.json';
+document.body.appendChild(a);a.click();document.body.removeChild(a);
+alert('抓取完成: '+ok+' 个成功, '+err+' 个失败\n已下载 scrape_all.json 到 Downloads');
+})();"""
+    bookmarklet = "javascript:" + urllib.parse.quote(
+        bookmarklet_body.replace("__SUPPLIERS__", suppliers_js).replace("\n", " "),
+        safe="():;,{}[]=/|&+.*!$?~"   # 不含 " ' 让它们变 %22 %27, 保证 HTML 属性安全
+    )
+    html = """<!DOCTYPE html><meta charset="utf-8">
+<title>安装挑品抓取书签</title>
+<style>
+body{font-family:-apple-system,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#1d1d1f;line-height:1.6}
+h1{font-size:20px}
+.btn{display:inline-block;padding:10px 24px;background:#0071e3;color:#fff!important;border-radius:20px;text-decoration:none;font-weight:600;font-size:16px}
+.steps{background:#f5f5f7;padding:16px 20px;border-radius:12px;margin:16px 0}
+.steps ol{margin:0;padding-left:20px}
+code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:13px}
+</style>
+<h1>📦 挑品抓取书签</h1>
+<p><b>拖下面这个蓝色按钮到浏览器书签栏</b>(不要点它):</p>
+<p><a class="btn" href="__HREF__">🛒 抓挑品数据</a></p>
+<div class="steps">
+<b>使用方法:</b>
+<ol>
+<li>登录微购相册网页版 <code>https://www.szwego.com/static/index.html</code></li>
+<li>随便进一个页面(相册动态即可)</li>
+<li>点书签栏里的「🛒 抓挑品数据」</li>
+<li>等几秒 → 自动下载 <code>scrape_all.json</code> 到 Downloads</li>
+<li>回终端跑 <code>python3 pick_products.py</code></li>
+</ol>
+</div>
+<p style="color:#666;font-size:13px">书签内置了 config.json 里配的 __N__ 个供货商。以后加了新供货商,重新生成书签即可。</p>
+"""
+    html = html.replace("__HREF__", bookmarklet).replace("__N__", str(len(config.get("suppliers", {}))))
+    BOOKMARKLET_FILE.write_text(html, encoding="utf-8")
+    print(f"✓ 书签安装页已生成: {BOOKMARKLET_FILE}")
+    try:
+        import webbrowser
+        webbrowser.open(BOOKMARKLET_FILE.as_uri())
+        print("  已在浏览器打开, 拖蓝色按钮到书签栏即可")
+    except Exception:
+        print(f"  请手动打开: {BOOKMARKLET_FILE}")
+
+
+def _apply_defaults(config):
+    """把 config.defaults 里的默认值应用到环境变量(允许命令行/环境覆盖)."""
+    global MAX_PRODUCTS
+    d = config.get("defaults") or {}
+    if not MAX_PRODUCTS and d.get("max_products"):
+        MAX_PRODUCTS = int(d["max_products"])
+
+
 def main():
     # 位置参数: [mode] [供货商] [编码]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
-    mode = "run"
-    if positional and positional[0] in ("preview", "process", "run"):
+    mode = ""
+    if positional and positional[0] in ("preview", "process", "run", "bookmark"):
         mode = positional.pop(0)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
     code_arg = positional[1] if len(positional) >= 2 else ""
 
-    # 供货商/编码: 位置参数优先, 否则环境变量
     supplier = supplier_arg or os.environ.get("SUPPLIERS", "")
     code = code_arg or os.environ.get("CODE", "")
     if supplier:
-        os.environ["SUPPLIERS"] = supplier  # 让 select_suppliers 跳过菜单
+        os.environ["SUPPLIERS"] = supplier
 
     config = load_json_or(CONFIG_FILE, None)
     if not config:
         print(f"配置文件不存在: {CONFIG_FILE}"); sys.exit(1)
+    _apply_defaults(config)
     progress = load_json_or(PROGRESS_FILE, {})
 
+    # bookmark: 生成书签安装页
+    if mode == "bookmark":
+        cmd_install_bookmark(config); return
+
+    # process: 老入口, 自动化脚本用. 交互模式默认走合并流程, 不再需要用户手动 process
     if mode == "process":
         paths = [a for a in sys.argv[1:] if a.endswith(".json") and "config" not in a]
         if not paths:
             print("用法: python3 pick_products.py process <confirmed_groups.json>"); sys.exit(1)
-        cmd_process_confirmed(config, progress, paths[0])
-        return
+        cmd_process_confirmed(config, progress, paths[0]); return
 
-    scrape_path = os.environ.get("SCRAPE_JSON", "")
+    default_scrape = Path.home() / "Downloads" / "scrape_all.json"
+    scrape_path = os.environ.get("SCRAPE_JSON") or (str(default_scrape) if default_scrape.exists() else "")
     if not scrape_path:
-        print("请设置 SCRAPE_JSON=<抓取json路径> 环境变量"); sys.exit(1)
+        print(f"❌ 没找到抓取数据: {default_scrape}")
+        print(f"   请先在浏览器点「🛒 抓挑品数据」书签抓一次数据。")
+        print(f"   还没装书签? 运行: python3 pick_products.py bookmark"); sys.exit(1)
+    print(f"读取抓取数据: {scrape_path}")
     data = load_scrape(scrape_path, config)
 
-    if mode == "preview":
-        cmd_preview(config, progress, data, code=code)
-        return
+    # run: 显式跳过预览(自动化用)
+    if mode == "run":
+        available = [(b.get("supplier", aid[-8:]), aid, len(b.get("items", [])))
+                     for aid, b in data.items() if b.get("items")]
+        if not available:
+            print("抓取数据里没有任何供货商内容"); return
+        chosen = select_suppliers(available)
+        if not chosen:
+            print("未选择任何供货商, 退出"); return
+        print(f"\n将处理 {len(chosen)} 个供货商: {', '.join(c[0] for c in chosen)}"
+              + (f"  [定向编码: {code}]" if code else ""))
+        fs_cfg = config.get("feishu") or {}
+        feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
+        if feishu: print("✓ 飞书已配置")
+        ai_cfg = config.get("ai_vision") or {}
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        total = 0
+        for name, aid, _ in chosen:
+            total += process_supplier(name, aid, data[aid]["items"], progress, feishu, fs_cfg, ai_cfg, code=code)
+        print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品"); return
 
-    # mode == run: 直接处理(无预览)
-    available = [(b.get("supplier", aid[-8:]), aid, len(b.get("items", [])))
-                 for aid, b in data.items() if b.get("items")]
-    if not available:
-        print("抓取数据里没有任何供货商内容"); return
-    chosen = select_suppliers(available)
-    if not chosen:
-        print("未选择任何供货商, 退出"); return
-    print(f"\n将处理 {len(chosen)} 个供货商: {', '.join(c[0] for c in chosen)}"
-          + (f"  [定向编码: {code}]" if code else ""))
-    fs_cfg = config.get("feishu") or {}
-    feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
-    if feishu:
-        print("✓ 飞书已配置")
-    ai_cfg = config.get("ai_vision") or {}
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    total = 0
-    for name, aid, _ in chosen:
-        total += process_supplier(name, aid, data[aid]["items"], progress, feishu, fs_cfg, ai_cfg, code=code)
-    print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
+    # 默认: 交互全流程 (preview 单独也走这个, 但不等待/不处理)
+    cmd_preview(config, progress, data, code=code)
+    if mode == "preview":
+        return   # 显式 preview: 只生成预览, 不等待
+
+    # 合并流程: 等 confirmed_groups.json 出现后自动接着 process
+    confirmed = wait_for_confirmed()
+    if not confirmed:
+        print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
+        return
+    print(f"\n✓ 收到确认文件: {confirmed}, 开始处理...")
+    cmd_process_confirmed(config, progress, str(confirmed))
+    # 处理完把 confirmed 挪走, 避免下次误触
+    try:
+        confirmed.rename(confirmed.with_suffix(".done.json"))
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

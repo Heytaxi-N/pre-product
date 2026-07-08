@@ -1,74 +1,77 @@
 # 微购相册挑品自动化
 
-从微购相册(szwego)供货商的「上新」批量挑品,自动完成:抓数据 → AI 分组成产品 → 下载图片 → AI 分类排序 → 写飞书多维表格 → 按图片名建产品文件夹。产出的文件夹供下游上架脚本读取。
+从微购相册(szwego)供货商的「上新」批量挑品:抓数据 → AI 分组成产品 → 下载图片 → AI 分类排序 → 写飞书多维表格 → 按图片名建产品文件夹。产出的文件夹供下游上架脚本读取。
 
 ## 它做什么
 
-1. **抓上新** — 从供货商的「上新」接口取当天新品(帖子含文案 + 多张图 + 可选视频)。
-2. **AI 分组** — 同一件商品常被拆成 3~4 个帖子(正视图/价格图/模特图/尺码表分开发)。用 AI 看主图+文案,把相邻帖子判定为同款并合并成一个产品。
-3. **人工兜底** — 生成「分组预览」网页,缩略图 + 文案一目了然,点两帖之间的按钮改边界,确认后再处理。应对「专场」这类 AI 难分干净的情况。
-4. **AI 分类排图** — 每张图分类(合图/价格图/模特图/细节图/尺码表/视频),按规则排序:
+1. **抓上新** — 从供货商的「上新」接口取新品(帖子含文案 + 多张图 + 可选视频)。
+2. **占位图切边界** — 识别与服装无关的占位/分割图,作为产品和批的硬边界,不下载。
+3. **AI 分组** — 同一件商品常被拆成 3~4 个帖子(正视图/价格图/模特图/尺码表分开发)。AI 看主图+文案,把相邻帖子判定为同款并合并成一个产品。
+4. **人工兜底** — 生成「分组预览」网页,缩略图 + 文案一目了然,点两帖之间的按钮改边界。
+5. **AI 分类排图** — 每张图分类,按规则排序:
    `合图(最清晰美观的一张作封面) → 价格图 → 模特图 → 其余合图 → 细节图 → 尺码表 → 视频`
-5. **写飞书** — 合并后的文案写入多维表格「信息」字段;飞书自动化据此生成「图片名」。
-6. **建文件夹** — 以图片名建文件夹,图片按 `图片名+序号` 命名(如 `凯速干裤01.jpg`);尺码表命名为 `尺码表`,视频命名为 `视频01`。
+6. **写飞书** — 合并后的文案写入多维表格「信息」字段;飞书自动化据此生成「图片名」。
+7. **建文件夹** — 以图片名建文件夹,图片按 `图片名+序号` 命名(如 `凯速干裤01.jpg`);尺码表命名为 `尺码表`,视频命名为 `视频01`。
 
-## 快速开始
+## 一次性配置(只做一次)
 
-### 1. 配置
+### ① 填 config.json
 
-复制 `config.example.json` 为 `config.json` 并填写:
+复制 `config.example.json` 为 `config.json`,填 `suppliers`、`ai_vision.api_key`、`feishu` 四个字段。飞书还需要在开放平台开表格读写权限,并把应用**加入到那张多维表格**(可编辑)。
 
-```json
-{
-  "suppliers": { "供货商名": "albumId(从网页版URL #/shop_detail/后面那段取)" },
-  "ai_vision": { "base_url": "...", "api_key": "...", "model": "qwen3-vl-flash" },
-  "feishu": { "app_id": "...", "app_secret": "...", "base_id": "...", "table_id": "...",
-              "info_field": "信息", "img_name_field": "图片名" }
-}
-```
-
-> `config.json` 含密码/密钥,已被 `.gitignore` 排除,不会进 git。
-
-飞书需在「开放平台」给应用开多维表格读写权限,并把应用**加入到具体那张多维表格**(可编辑)。
-
-### 2. 抓数据
-
-在浏览器里登录微购相册网页版,抓取全部供货商的上新数据存成 `scrape_all.json`(结构见下)。目前这一步由 Claude Code 在浏览器执行。
-
-```json
-{ "data": { "albumId": { "supplier": "供货商名", "items": [ {"goods_id","title","imgsSrc","time_stamp","videoUrl"} ] } } }
-```
-
-### 3. 预览分组(推荐)
+### ② 装抓取书签
 
 ```bash
-SCRAPE_JSON=~/Downloads/scrape_all.json python3 pick_products.py preview
+python3 pick_products.py bookmark
 ```
 
-按提示多选供货商(`1,3,5` / `1-4` / `all`),自动打开「分组预览.html」。调整边界后点「确认并下载」,得到 `confirmed_groups.json`。
+浏览器会自动打开一个安装页,**把里面的蓝色按钮拖到书签栏**——完事。以后加了新供货商,重新运行这条命令重装书签即可。
 
-### 4. 处理
+## 日常挑品(每天)
+
+**只有 2 步**:
+
+**① 抓数据** — 浏览器登录 [www.szwego.com](https://www.szwego.com/static/index.html) → 点书签栏的「🛒 抓挑品数据」→ `scrape_all.json` 自动下载到 Downloads(几秒)。
+
+**② 跑脚本** — 一条命令跑完:
 
 ```bash
-python3 pick_products.py process ~/Downloads/confirmed_groups.json
+cd ~/Downloads/上架前准备
+python3 pick_products.py
 ```
 
-下载图片、AI 分类排序、写飞书、建文件夹一气呵成。
+脚本会自己:
+1. 读 `~/Downloads/scrape_all.json`
+2. 交互菜单让你选供货商
+3. AI 分组、弹「分组预览.html」到浏览器
+4. 你在网页里调整分组边界(可选)→ 点右上角「✅ 确认并下载」
+5. 脚本**自动接收** `confirmed_groups.json` → 下载图 → AI 分类 → 写飞书 → 建文件夹
 
-## 运行模式
+整个过程零环境变量、零路径粘贴。
 
-| 命令 | 说明 |
-|------|------|
-| `pick_products.py preview` | 生成分组预览网页(人工确认前) |
-| `pick_products.py process <confirmed.json>` | 按确认的分组处理 |
-| `pick_products.py run` | 直接处理(AI 分组,不预览),适合以后自动化 |
+## 高级用法
 
-多选供货商:交互菜单,或用环境变量 `SUPPLIERS="供货商A,供货商B"`(或 `all`)跳过菜单。
-限制产品数(调试用):`MAX_PRODUCTS=1`。
+### 定向下载
+
+只处理某供货商、文案含某编码的素材:
+
+```bash
+python3 pick_products.py run 晨星外贸06 0708d
+```
+
+定向模式**不推进进度**,下次跑仍能拿到这批。
+
+### 单独入口(给自动化脚本用)
+
+- `python3 pick_products.py bookmark` — 生成/更新书签安装页
+- `python3 pick_products.py run [供货商] [编码]` — 直接跑,不弹预览
+- `python3 pick_products.py process <confirmed.json>` — 只处理已确认的分组文件
+
+环境变量:`SUPPLIERS=`、`CODE=`、`MAX_PRODUCTS=`、`SCRAPE_JSON=`。
 
 ## 进度记录
 
-`progress.json` 记录每个供货商上次处理到的时间戳。首次只处理最新日期的产品,之后只处理更新的部分。
+`progress.json` 记录每个供货商上次处理到的**日期**。首次只处理最新日期的产品,之后只处理更晚日期的。定向下载不推进进度。
 
 ## 输出
 
@@ -77,6 +80,6 @@ python3 pick_products.py process ~/Downloads/confirmed_groups.json
 ## 文件
 
 - `pick_products.py` — 主脚本
-- `capture_szwego.py` — mitmproxy 抓包辅助(备用,当前用浏览器抓)
 - `config.example.json` — 配置模板
+- `capture_szwego.py` — mitmproxy 抓包辅助(备用,当前用书签抓)
 - `上架SKILLS.md` — 原始需求

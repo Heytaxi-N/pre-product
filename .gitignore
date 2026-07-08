@@ -8,6 +8,7 @@ progress.json
 # 生成的预览/确认文件
 分组预览.html
 confirmed_groups.json
+install_bookmark.html
 
 # 抓取数据
 scrape*.json
