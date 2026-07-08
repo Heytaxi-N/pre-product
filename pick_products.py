@@ -92,21 +92,74 @@ def _ai_same_product(ai_cfg, a, b, cache_dir):
     except Exception:
         return False
 
+def _is_placeholder(ai_cfg, item, cache_dir):
+    """AI 判断某帖主图是否为'与服装无关的占位/分割图'. 失败保守返回 False."""
+    base_url = (ai_cfg or {}).get("base_url", "").rstrip("/")
+    api_key = (ai_cfg or {}).get("api_key", "")
+    model = (ai_cfg or {}).get("model", "qwen3-vl-flash")
+    if not (base_url and api_key):
+        return False
+    ip = _ensure_first_image(item, cache_dir)
+    if not ip:
+        return False
+    mime = "image/png" if ip.suffix.lower() == ".png" else "image/jpeg"
+    durl = f"data:{mime};base64,{base64.b64encode(ip.read_bytes()).decode()}"
+    prompt = (
+        "这是微商相册里的一张图。判断它是【服装商品图】还是【占位/分割图】。\n"
+        "占位/分割图: 与具体服装商品无关, 用来隔开不同产品的图, 例如纯文字提示图、"
+        "logo图、下单引导图、二维码图、装饰海报、空白/背景图等。\n"
+        "服装商品图: 能看到具体的衣服/裤子/鞋帽/包等商品(平铺、挂拍、模特、细节都算)。\n"
+        "只回复一个字: 占位 或 商品"
+    )
+    payload = {"model": model, "max_tokens": 10, "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": durl}},
+        {"type": "text", "text": prompt},
+    ]}]}
+    try:
+        resp = http_post_json(f"{base_url}/chat/completions", payload,
+                              headers={"Authorization": f"Bearer {api_key}"})
+        ans = resp["choices"][0]["message"]["content"].strip()
+        return "占位" in ans[:4]
+    except Exception:
+        return False
+
 def group_products_ai(ai_cfg, items, cache_dir):
-    """时间升序. 每帖跟【当前组的锚点(第一帖)】比是否同款, 而非跟上一帖比,
-    避免链式漂移把一整个'专场'的不同货连成一组. 间隔过大直接拆开.
+    """先用占位图(分割线)切硬边界并剔除占位帖; 段内再跑相邻 AI 图文分组.
+    带占位图的供货商靠占位图切干净; 不带的沿用原逻辑.
     """
     items = sorted(items, key=lambda x: x["time_stamp"])
     if len(items) <= 1:
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
         return [list(items)] if items else []
-    groups = [[items[0]]]
-    for cur in items[1:]:
-        prev = groups[-1][-1]
-        gap = (cur["time_stamp"] - prev["time_stamp"]) / 1000
-        if gap <= GROUP_MAX_GAP and _ai_same_product(ai_cfg, prev, cur, cache_dir):
-            groups[-1].append(cur)
+
+    # 第一遍: 占位判定, 按占位帖切成若干段(占位帖本身丢弃, 不下载)
+    # ponytail: 每帖一次占位判定, 若调用量成问题再合并进分组调用
+    segments = [[]]
+    for it in items:
+        if _is_placeholder(ai_cfg, it, cache_dir):
+            if segments[-1]:
+                segments.append([])   # 遇占位图 → 起新段
         else:
-            groups.append([cur])
+            segments[-1].append(it)
+    segments = [s for s in segments if s]
+
+    # 第二遍: 每段内部再跑相邻 AI 图文分组
+    groups = []
+    for seg in segments:
+        if len(seg) == 1:
+            groups.append(seg)
+            continue
+        cur_groups = [[seg[0]]]
+        for cur in seg[1:]:
+            prev = cur_groups[-1][-1]
+            gap = (cur["time_stamp"] - prev["time_stamp"]) / 1000
+            if gap <= GROUP_MAX_GAP and _ai_same_product(ai_cfg, prev, cur, cache_dir):
+                cur_groups[-1].append(cur)
+            else:
+                cur_groups.append([cur])
+        groups.extend(cur_groups)
+
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)  # 用完删首图缓存
     return groups
@@ -391,19 +444,31 @@ def select_suppliers(available):
     return [available[i - 1] for i in sorted(chosen) if 1 <= i <= len(available)]
 
 
+def _item_date(it):
+    return datetime.fromtimestamp(it["time_stamp"] / 1000).strftime("%Y-%m-%d")
+
+def _progress_date(progress, album_id):
+    """取上次处理到的日期串. 兼容旧格式(int 毫秒时间戳)."""
+    v = progress.get(album_id)
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v / 1000).strftime("%Y-%m-%d")
+    return str(v)
+
 def filter_new_items(album_id, raw_items, progress):
-    """按进度过滤: 首次只取最新日期, 之后取比上次新的."""
-    since_ts = progress.get(album_id, 0)
-    if not since_ts and raw_items:
-        max_ts = max(it["time_stamp"] for it in raw_items)
-        max_date = datetime.fromtimestamp(max_ts / 1000).strftime("%Y-%m-%d")
-        return [it for it in raw_items
-                if datetime.fromtimestamp(it["time_stamp"] / 1000).strftime("%Y-%m-%d") == max_date]
-    return [it for it in raw_items if it["time_stamp"] > since_ts]
+    """按天进度过滤: 首次只取最新日期; 之后取日期严格晚于上次处理日期的."""
+    last_date = _progress_date(progress, album_id)
+    if not last_date and raw_items:
+        max_date = max(_item_date(it) for it in raw_items)
+        return [it for it in raw_items if _item_date(it) == max_date]
+    return [it for it in raw_items if _item_date(it) > last_date]
 
 
-def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg):
-    """按给定分组处理: 下载→分类→排序→飞书→建文件夹. 返回产品数."""
+def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
+                   advance_progress=True):
+    """按给定分组处理: 下载→分类→排序→飞书→建文件夹. 返回产品数.
+    advance_progress=False 时不推进按天进度(定向/批量下载用)."""
     if MAX_PRODUCTS > 0:
         groups = groups[:MAX_PRODUCTS]
     for gi, group in enumerate(groups, 1):
@@ -443,23 +508,34 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
 
-    if groups:
-        progress[album_id] = max(it["time_stamp"] for group in groups for it in group)
+    if groups and advance_progress:
+        progress[album_id] = max(_item_date(it) for group in groups for it in group)
         save_json(PROGRESS_FILE, progress)
     return len(groups)
 
 
-def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cfg, ai_cfg):
-    """直接处理(不预览): 过滤→AI分组→处理."""
+def apply_code_filter(items, code):
+    """保留文案(title)包含 code 的条目."""
+    return [it for it in items if code in (it.get("title") or "")]
+
+
+def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cfg, ai_cfg, code=""):
+    """直接处理(不预览): 过滤→AI分组→处理.
+    code 非空 = 定向模式: 在全部条目里按编码筛, 跳过按天进度过滤, 且不推进进度."""
     print(f"\n{'='*50}\n处理供货商: {supplier_name}")
-    items = filter_new_items(album_id, raw_items, progress)
+    if code:
+        items = apply_code_filter(raw_items, code)
+        print(f"  定向: 文案含「{code}」的 {len(items)} 条 (不推进进度)")
+    else:
+        items = filter_new_items(album_id, raw_items, progress)
     if not items:
         print("  没有新内容")
         return 0
     print(f"  AI 分组中 ({len(items)} 帖)...")
     groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}")
     print(f"  分为 {len(groups)} 个产品")
-    return process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg)
+    return process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
+                          advance_progress=not code)
 
 
 # ── 预览确认界面 ──────────────────────────────────────
@@ -587,8 +663,8 @@ renderFlat();
     out_path.write_text(html, encoding="utf-8")
 
 
-def cmd_preview(config, progress, data):
-    """生成分组预览 HTML."""
+def cmd_preview(config, progress, data, code=""):
+    """生成分组预览 HTML. code 非空 = 定向: 按编码筛全部条目, 不看进度."""
     available = [(b.get("supplier", aid[-8:]), aid, len(b.get("items", [])))
                  for aid, b in data.items() if b.get("items")]
     if not available:
@@ -600,7 +676,11 @@ def cmd_preview(config, progress, data):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     previews = []
     for name, aid, _ in chosen:
-        items = filter_new_items(aid, data[aid]["items"], progress)
+        if code:
+            items = apply_code_filter(data[aid]["items"], code)
+            print(f"  {name}: 定向文案含「{code}」 {len(items)} 条")
+        else:
+            items = filter_new_items(aid, data[aid]["items"], progress)
         if not items:
             print(f"  {name}: 无新内容, 跳过"); continue
         print(f"  {name}: AI 分组中 ({len(items)} 帖)...")
@@ -654,15 +734,26 @@ def cmd_process_confirmed(config, progress, confirmed_path):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.endswith(".json") or a in ("config.json",)]
-    mode = args[0] if args and args[0] in ("preview", "process", "run") else "run"
+    # 位置参数: [mode] [供货商] [编码]  (config.json 之类的 .json 不算位置参数)
+    positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
+    mode = "run"
+    if positional and positional[0] in ("preview", "process", "run"):
+        mode = positional.pop(0)
+    supplier_arg = positional[0] if len(positional) >= 1 else ""
+    code_arg = positional[1] if len(positional) >= 2 else ""
+
+    # 供货商/编码: 位置参数优先, 否则环境变量
+    supplier = supplier_arg or os.environ.get("SUPPLIERS", "")
+    code = code_arg or os.environ.get("CODE", "")
+    if supplier:
+        os.environ["SUPPLIERS"] = supplier  # 让 select_suppliers 跳过菜单
+
     config = load_json_or(CONFIG_FILE, None)
     if not config:
         print(f"配置文件不存在: {CONFIG_FILE}"); sys.exit(1)
     progress = load_json_or(PROGRESS_FILE, {})
 
     if mode == "process":
-        # process <confirmed.json>
         paths = [a for a in sys.argv[1:] if a.endswith(".json") and "config" not in a]
         if not paths:
             print("用法: python3 pick_products.py process <confirmed_groups.json>"); sys.exit(1)
@@ -675,7 +766,7 @@ def main():
     data = load_scrape(scrape_path, config)
 
     if mode == "preview":
-        cmd_preview(config, progress, data)
+        cmd_preview(config, progress, data, code=code)
         return
 
     # mode == run: 直接处理(无预览)
@@ -686,7 +777,8 @@ def main():
     chosen = select_suppliers(available)
     if not chosen:
         print("未选择任何供货商, 退出"); return
-    print(f"\n将处理 {len(chosen)} 个供货商: {', '.join(c[0] for c in chosen)}")
+    print(f"\n将处理 {len(chosen)} 个供货商: {', '.join(c[0] for c in chosen)}"
+          + (f"  [定向编码: {code}]" if code else ""))
     fs_cfg = config.get("feishu") or {}
     feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
     if feishu:
@@ -695,7 +787,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     total = 0
     for name, aid, _ in chosen:
-        total += process_supplier(name, aid, data[aid]["items"], progress, feishu, fs_cfg, ai_cfg)
+        total += process_supplier(name, aid, data[aid]["items"], progress, feishu, fs_cfg, ai_cfg, code=code)
     print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
 
 
