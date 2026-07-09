@@ -231,11 +231,12 @@ def download_product_images(product_items, tmp_dir):
 
 
 # ── AI 分类 ───────────────────────────────────────────
-CATEGORIES = ["合图", "价格图", "模特图", "细节图", "尺码表", "其他"]
+CATEGORIES = ["合图", "价格图", "产品包装图", "模特图", "官方介绍图", "细节图", "尺码表", "其他"]
 
 def classify_images_ai(ai_config, image_paths):
-    """OpenAI 兼容视觉 API: 返回 [(path, category, cover_score), ...]
-    cover_score 只对 "合图" 有意义, 数字 1-5, 用于选封面; 其他类为 0.
+    """OpenAI 兼容视觉 API: 返回 [(path, category, score, color), ...]
+    score: 合图/模特图 1-5(选封面/挑最佳), 其它类 0.
+    color: 服装主色简称, 只用于细节图按色分组; 不适用为空串.
     """
     base_url = (ai_config or {}).get("base_url", "").rstrip("/")
     api_key = (ai_config or {}).get("api_key", "")
@@ -245,28 +246,31 @@ def classify_images_ai(ai_config, image_paths):
         return [(p, "其他", 0) for p in image_paths]
 
     prompt = (
-        "这是服装产品图,请严格分类。只回复 JSON,格式: {\"cat\":\"类别\",\"score\":数字}\n"
+        "这是服装产品图,请严格分类。只回复 JSON,格式: {\"cat\":\"类别\",\"score\":数字,\"color\":\"主色\"}\n"
         "类别按优先级判断:\n"
-        "1) 尺码表: 数字表格/尺寸数据表(即使背景有商品)\n"
-        "2) 价格图: 明显的价格数字或价格牌标注\n"
-        "3) 模特图: 画面中有真人的身体部位(手/脚/腿/上身/全身),不论露不露脸\n"
-        "4) 合图: 无真人,拍到完整的商品整体(能看到整条裤/整件衣的大部分长度),且画面里有2件以上的相同款不同色/不同版本平铺或挂拍\n"
-        "5) 细节图: 无真人,局部特写(腰头/口袋/拉链/logo/标签/面料/走线/裤脚等),即使画面里有多个颜色的局部也算细节图\n"
-        "6) 其他: 都不符合(如封面海报/纯背景图)\n"
-        "重要:只要不是完整商品的多色平铺挂拍,就不算合图;局部特写永远是细节图。\n"
-        "score: 仅当 cat=合图 时给 1-5 分(视角好/清晰/整件可见/信息量大越高);其它类均为 0"
+        "1) 尺码表: 含尺码数据的数字表格/尺寸数据表(即使背景有商品)\n"
+        "2) 价格图: 官网/电商店铺(如天猫/淘宝)的价格截图(带价格数字);商品吊牌/价格牌不算价格图\n"
+        "3) 产品包装图: 主体是商品包装(盒子/牛皮纸/包装袋/防尘袋/吊牌包装等),而非衣物本身\n"
+        "4) 模特图: 画面中有真人的身体部位(手/脚/腿/上身/全身),不论露不露脸\n"
+        "5) 官方介绍图: 图文排版的卖点/功能/面料/工艺说明这类官方宣传图(通常带成段文字, 非实拍穿搭)\n"
+        "6) 合图: 无真人,拍到完整的商品整体,且画面里有2件以上的相同款不同色/不同版本平铺或挂拍(多色)\n"
+        "7) 细节图: 无真人的单张商品展示——整件单色的平铺/挂拍(非多色), 或局部特写(腰头/口袋/拉链/logo/标签/吊牌/面料/走线/裤脚等)\n"
+        "8) 其他: 都不符合(如封面海报/纯背景图/无关配图)\n"
+        "重要:只有多色平铺挂拍才算合图,单色整件归细节图;带整段文字说明的官方图优先归官方介绍图;主体是包装物的归产品包装图;吊牌归细节图不归价格图。\n"
+        "score: 仅当 cat=合图 或 模特图 时给 1-5 分(实拍、清晰、美观、整件可见/信息量大越高);其它类均为 0\n"
+        "color: 该图服装的主色简称(如 白/黑/灰/岩灰绿/卡其/藏青),看不清或不适用给空串"
     )
 
     results = []
     for img_path in image_paths:
         if img_path.suffix.lower() in (".mp4", ".mov", ".avi"):
-            results.append((img_path, "视频", 0))
+            results.append((img_path, "视频", 0, ""))
             continue
         img_b64 = base64.b64encode(img_path.read_bytes()).decode()
         mime = "image/png" if img_path.suffix.lower() == ".png" else "image/jpeg"
         payload = {
             "model": model,
-            "max_tokens": 60,
+            "max_tokens": 80,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -286,37 +290,55 @@ def classify_images_ai(ai_config, image_paths):
             if cat not in CATEGORIES:
                 cat = "其他"
             score = int(parsed.get("score", 0) or 0)
-            results.append((img_path, cat, score))
-            tag = f"[{cat}" + (f" 分{score}" if cat == "合图" else "") + "]"
+            color = str(parsed.get("color", "") or "").strip()
+            results.append((img_path, cat, score, color))
+            tag = f"[{cat}" + (f" 分{score}" if cat in ("合图", "模特图") else "") \
+                + (f" {color}" if cat == "细节图" and color else "") + "]"
             print(f"    {img_path.name} → {tag}")
         except Exception as e:
             print(f"    {img_path.name} → 分类失败({e}), 归为其他")
-            results.append((img_path, "其他", 0))
+            results.append((img_path, "其他", 0, ""))
         time.sleep(0.15)
 
     return results
 
 
 def sort_by_new_rule(classified):
-    """新顺序: 合图(最佳1张) → 价格图 → 模特图 → 合图(其余) → 细节图 → 尺码表 → 视频 → 其他"""
-    by_cat = {c: [] for c in CATEGORIES + ["视频"]}
-    for triple in classified:
-        by_cat.setdefault(triple[1], []).append(triple)
+    """新顺序(每类空则跳过):
+      合图(实拍最美1张) → 价格图(1张) → 产品包装图(≤3) → 模特图(评分前15)
+      → 官方介绍图(≤5) → 合图其余 → 细节图(按颜色分组) → 尺码表(1张) → 视频
+    "其他"(无法辨别)整类丢弃, 不进文件夹。元素为 (path, cat, score, color) 四元组。"""
+    by_cat = {}
+    for t in classified:
+        by_cat.setdefault(t[1], []).append(t)
 
-    # 合图按 score 降序; 挑最高作为封面, 其余排后面
+    # 合图: score 降序, 最高作封面, 其余排后
     hetu = sorted(by_cat.get("合图", []), key=lambda x: -x[2])
-    cover = [hetu[0]] if hetu else []
-    hetu_rest = hetu[1:]
+    cover, hetu_rest = hetu[:1], hetu[1:]
+    # 价格图留 1 张; 包装图 ≤3; 模特图取评分前 10; 官方介绍图 ≤5
+    price = by_cat.get("价格图", [])[:1]
+    package = by_cat.get("产品包装图", [])[:3]
+    models = sorted(by_cat.get("模特图", []), key=lambda x: -x[2])[:15]
+    official = by_cat.get("官方介绍图", [])[:5]
+    # 细节图按颜色分组(同色相邻), 颜色按首次出现顺序; 组内保持原序(stable sort)
+    detail = by_cat.get("细节图", [])
+    color_order = []
+    for t in detail:
+        if (t[3] or "") not in color_order:
+            color_order.append(t[3] or "")
+    detail = sorted(detail, key=lambda t: color_order.index(t[3] or ""))
 
     ordered = []
-    ordered.extend(cover)
-    ordered.extend(by_cat.get("价格图", []))
-    ordered.extend(by_cat.get("模特图", []))
-    ordered.extend(hetu_rest)
-    ordered.extend(by_cat.get("细节图", []))
-    ordered.extend(by_cat.get("尺码表", []))
-    ordered.extend(by_cat.get("视频", []))
-    ordered.extend(by_cat.get("其他", []))
+    ordered += cover
+    ordered += price
+    ordered += package
+    ordered += models
+    ordered += official
+    ordered += hetu_rest
+    ordered += detail
+    ordered += by_cat.get("尺码表", [])[:1]
+    ordered += by_cat.get("视频", [])
+    # "其他"整类丢弃
     return ordered
 
 
@@ -397,7 +419,7 @@ def create_product_folder(sorted_images, folder_name, output_dir):
     vid_idx = 0
     size_idx = 0
     size_count = sum(1 for t in sorted_images if t[1] == "尺码表")
-    for src, cat, _ in sorted_images:
+    for src, cat, *_rest in sorted_images:
         if cat == "尺码表":
             size_idx += 1
             name = "尺码表" if size_count == 1 else f"尺码表{size_idx:02d}"
@@ -519,12 +541,23 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         if not images:
             print("  无图片, 跳过")
             continue
+        # 相同的图只保留1张(按内容哈希去重, 保持顺序)
+        # ponytail: 精确字节去重; 需要"视觉近似"去重时再上感知哈希
+        seen_h, uniq = set(), []
+        for p in images:
+            h = hashlib.md5(p.read_bytes()).hexdigest()
+            if h in seen_h:
+                continue
+            seen_h.add(h); uniq.append(p)
+        if len(uniq) < len(images):
+            print(f"  去重: {len(images)} → {len(uniq)} 张")
+        images = uniq
         print(f"  下载 {len(images)} 张")
 
         classified = classify_images_ai(ai_cfg, images)
         sorted_imgs = sort_by_new_rule(classified)
         print("  排序:")
-        for i, (p, cat, sc) in enumerate(sorted_imgs, 1):
+        for i, (p, cat, *_rest) in enumerate(sorted_imgs, 1):
             print(f"    {i:2d}. [{cat}{' 封面' if i == 1 and cat == '合图' else ''}] {p.name}")
 
         folder_name = f"{supplier_name}_{latest_time.replace(' ', '_').replace(':', '')}_{gi}"
@@ -538,7 +571,6 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                 print(f"  ⚠ 飞书失败, 用默认文件夹名: {e}")
 
         folder = create_product_folder(sorted_imgs, folder_name, OUTPUT_DIR)
-        (folder / "文案.txt").write_text(combined_text, encoding="utf-8")
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
 
