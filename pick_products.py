@@ -770,10 +770,13 @@ def cmd_preview(config, progress, data, code=""):
 
 
 def _normalize_date(date_str):
-    """'MM-DD' → 'YYYY-MM-DD' (补当前年份); 已完整则返回."""
-    if len(date_str) == 5 and date_str[2] == "-":
-        return datetime.now().strftime("%Y") + "-" + date_str
-    return date_str
+    """各种简写 → 'YYYY-MM-DD'. 支持 MM-DD / MMDD / YYYY-MM-DD / YYYYMMDD, MM-DD 补当前年份."""
+    digits = date_str.strip().replace("-", "")
+    if len(digits) == 4:  # MMDD / MM-DD
+        return f"{datetime.now():%Y}-{digits[:2]}-{digits[2:]}"
+    if len(digits) == 8:  # YYYYMMDD / YYYY-MM-DD
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    return date_str.strip()  # 无法识别, 原样返回
 
 def _data_has_date(scrape_path, config, supplier_name, date_str):
     """检查 scrape 里指定供货商指定日期是否有内容."""
@@ -823,6 +826,29 @@ def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
     return True
 
 
+def pick_newest_download(base):
+    """Downloads 里 base*.json 取 mtime 最新的一个, 删掉其余旧副本,
+    把最新的规范化成 base.json 返回其路径; 没有则 None。
+    解决 Chrome 去重改名 (scrape_all (1).json) + 历史副本堆积。"""
+    dls = sorted((Path.home() / "Downloads").glob(f"{base}*.json"),
+                 key=lambda p: p.stat().st_mtime)
+    if not dls:
+        return None
+    newest = dls[-1]
+    for p in dls[:-1]:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    canon = newest.parent / f"{base}.json"
+    if newest != canon:
+        try:
+            newest.replace(canon); newest = canon
+        except Exception:
+            pass
+    return newest
+
+
 def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240):
     """前置: 确保 scrape 里有 supplier_name 在 date_str 的数据. 缺失则打开带 anchor 参数的 szwego,
     让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
@@ -849,9 +875,11 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
     print(f"     还没装/需要更新书签: 另开终端跑 python3 pick_products.py bookmark")
     print(f"  ⏳ 监听下载... (最长 {timeout} 秒, Ctrl+C 取消)")
 
-    downloads = Path.home() / "Downloads"
-    anchor_dl = downloads / "scrape_anchor.json"
     all_dl = Path(scrape_path)
+    # 清掉残留的深挖文件, 让 Chrome 写出干净的 scrape_anchor.json 而不是 (1)
+    for p in (Path.home() / "Downloads").glob("scrape_anchor*.json"):
+        try: p.unlink()
+        except Exception: pass
     # 记录开始时刻, 忽略更早的旧文件
     start_ts = time.time() - 1
     all_dl_orig_mtime = all_dl.stat().st_mtime if all_dl.exists() else 0
@@ -860,8 +888,9 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
         end = time.time() + timeout
         while time.time() < end:
             time.sleep(1)
-            # 优先看 anchor 深挖
-            if anchor_dl.exists() and anchor_dl.stat().st_mtime > start_ts:
+            # 优先看 anchor 深挖 (认 Chrome 改名的 scrape_anchor (1).json)
+            anchor_dl = pick_newest_download("scrape_anchor")
+            if anchor_dl and anchor_dl.stat().st_mtime > start_ts:
                 s1 = anchor_dl.stat().st_size; time.sleep(0.5)
                 if anchor_dl.stat().st_size != s1: continue
                 print(f"  ⇣ 收到深挖数据: {anchor_dl}")
@@ -874,15 +903,16 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                         print(f"⚠ 深挖翻完了仍没抓到 {date_str}(供货商可能真没在这天上新)")
                         return False
             # 兼容: 用户点了普通书签(不带 anchor 参数抓的全量)
-            if all_dl.exists() and all_dl.stat().st_mtime > all_dl_orig_mtime and all_dl.stat().st_mtime > start_ts:
-                s1 = all_dl.stat().st_size; time.sleep(0.5)
-                if all_dl.stat().st_size != s1: continue
+            all_new = pick_newest_download("scrape_all")
+            if all_new and all_new.stat().st_mtime > all_dl_orig_mtime and all_new.stat().st_mtime > start_ts:
+                s1 = all_new.stat().st_size; time.sleep(0.5)
+                if all_new.stat().st_size != s1: continue
                 if _data_has_date(scrape_path, config, supplier_name, date_str):
                     print("✓ 全量数据里有目标日期")
                     return True
                 else:
                     print(f"⚠ 全量抓完仍没有 {date_str}, 请点带深挖的书签(URL 里带 anchor 参数)")
-                    all_dl_orig_mtime = all_dl.stat().st_mtime  # 记录已看过
+                    all_dl_orig_mtime = all_new.stat().st_mtime  # 记录已看过
     except KeyboardInterrupt:
         print("\n已取消")
     print("超时"); return False
@@ -907,8 +937,7 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
         print(f"❌ 抓取数据里没有 「{supplier_name}」 的内容"); return
 
     # 2. 日期规范化
-    if len(date_str) == 5 and date_str[2] == "-":
-        date_str = datetime.now().strftime("%Y") + "-" + date_str
+    date_str = _normalize_date(date_str)
     print(f"锚点定位: 供货商={supplier_name} 日期={date_str} 关键词=「{keyword}」")
 
     # 3. 该日期条目, 按时间升序
@@ -1204,23 +1233,25 @@ def main():
         cmd_process_confirmed(config, progress, paths[0]); return
 
     default_scrape = Path.home() / "Downloads" / "scrape_all.json"
-    scrape_path = os.environ.get("SCRAPE_JSON") or (str(default_scrape) if default_scrape.exists() else "")
+    env_scrape = os.environ.get("SCRAPE_JSON")
+    # anchor 模式即使本地没数据也继续 (ensure_data_for_date 会深挖创建)
+    if mode == "anchor":
+        if not (supplier_arg and code_arg and date_arg):
+            print("用法: python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD或YYYY-MM-DD>"); sys.exit(1)
+        scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
+        norm_date = _normalize_date(date_arg)
+        if not ensure_data_for_date(scrape_path, config, supplier_arg, norm_date):
+            print(f"❌ 未获取到 {norm_date} 的数据, 无法继续"); return
+        data = load_scrape(scrape_path, config)  # 深挖 merge 后加载
+        cmd_anchor(config, progress, data, supplier_arg, code_arg, date_arg); return
+
+    scrape_path = env_scrape or (str(pick_newest_download("scrape_all") or ""))
     if not scrape_path:
         print(f"❌ 没找到抓取数据: {default_scrape}")
         print(f"   请先在浏览器点「🛒 抓挑品数据」书签抓一次数据。")
         print(f"   还没装书签? 运行: python3 pick_products.py bookmark"); sys.exit(1)
     print(f"读取抓取数据: {scrape_path}")
     data = load_scrape(scrape_path, config)
-
-    # anchor: 锚点定向 (前置检查数据源, 缺失自动引导抓取)
-    if mode == "anchor":
-        if not (supplier_arg and code_arg and date_arg):
-            print("用法: python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD或YYYY-MM-DD>"); sys.exit(1)
-        norm_date = _normalize_date(date_arg)
-        if not ensure_data_for_date(scrape_path, config, supplier_arg, norm_date):
-            print(f"❌ 未获取到 {norm_date} 的数据, 无法继续"); return
-        data = load_scrape(scrape_path, config)  # 重抓后重新加载
-        cmd_anchor(config, progress, data, supplier_arg, code_arg, date_arg); return
 
     # run: 显式跳过预览(自动化用)
     if mode == "run":
