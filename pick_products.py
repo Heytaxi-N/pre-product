@@ -954,25 +954,17 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
         print(f"❌ 没有 title 含「{keyword}」的条目"); return
     print(f"  匹配锚点 {len(matched_ids)} 条")
 
-    # 5. 白图切段 + 从锚点段合并后续同款段.
-    #    用户模型: 一个产品被两张白色占位图(1图+空文案)包起来. 锚点是产品引流预告帖,
-    #    后面白图分隔了引流与正片, 再后面段是详情/展示. 只要下一段的代表帖跟锚点同款,
-    #    就合并; 直到某段代表帖不同款为止.
+    # 5. 结构性白图切段. 用户模型: 一个产品被两张白色占位图包起来,
+    #    占位图 = 只有 1 张图 且 无任何文案. 锚点所在段(两白图之间的整段)
+    #    就是该产品的全部素材(含各色号/模特/细节帖), 纯结构判定, 不需要 AI.
     ai_cfg = config.get("ai_vision") or {}
-    if not (ai_cfg.get("base_url") and ai_cfg.get("api_key")):
-        print("❌ 未配置 ai_vision, 无法进行 AI 同款判定"); return
-    cache_dir = TMP_ROOT / f"anchor_{aid[-8:]}"
     matched_indices = [i for i, it in enumerate(day_items) if it["goods_id"] in matched_ids]
 
-    MAX_MERGE_SEGS = 5  # 最多向后合并的段数(每段 1 次 AI 判定)
-
     def _is_struct_placeholder(item):
-        """结构性占位: 1 图 + 空文案. 用户明确指出这是白色占位图特征."""
         imgs = item.get("imgsSrc") or []
-        title = (item.get("title") or "").strip()
-        return len(imgs) == 1 and not title
+        return len(imgs) == 1 and not (item.get("title") or "").strip()
 
-    # 5a. 用结构性白图切当日成段(白图本身不属于任何段)
+    # 5a. 用白图把当日切成段(白图本身不属于任何段)
     placeholders = {i for i, it in enumerate(day_items) if _is_struct_placeholder(it)}
     segments = []
     cur = []
@@ -984,49 +976,14 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
     if cur: segments.append(cur)
     print(f"  当日按白图切成 {len(segments)} 段, 白图 {len(placeholders)} 张")
 
-    # 5b. 找每个锚点所在段, 合并锚点 + 后续同款段
-    visited = set()
-    target_segs = []
-    ai_calls = [0]
+    # 6. 锚点所在段 = 一个产品 (多个锚点落在同段只算一次)
+    all_groups = []
+    seen = set()
     for anchor_idx in matched_indices:
-        if anchor_idx in visited: continue
-        anchor_it = day_items[anchor_idx]
-        # 找锚点所在段的编号
-        seg_i = next((i for i, seg in enumerate(segments) if anchor_idx in seg), None)
-        if seg_i is None:
-            # 锚点自己是白图? 罕见, 跳过
-            target_segs.append([anchor_it])
-            visited.add(anchor_idx)
-            continue
-
-        collected_idxs = [anchor_idx]  # 先只放锚点自己(锚点段里其他帖可能是别的产品)
-        merged_segs = [seg_i]
-
-        # 向后合并: Sk+1, Sk+2, ..., 每段用第一帖跟锚点比是否同款
-        for next_i in range(seg_i + 1, min(seg_i + 1 + MAX_MERGE_SEGS, len(segments))):
-            next_seg = segments[next_i]
-            first_it = day_items[next_seg[0]]
-            ai_calls[0] += 1
-            time.sleep(0.15)
-            if _ai_same_product(ai_cfg, anchor_it, first_it, cache_dir):
-                collected_idxs.extend(next_seg)
-                merged_segs.append(next_i)
-            else:
-                break  # 不同款: 停止合并
-
-        collected_idxs.sort()
-        seg_items = [day_items[i] for i in collected_idxs]
-        target_segs.append(seg_items)
-        for i in collected_idxs: visited.add(i)
-        print(f"    锚点 #{anchor_idx} (段 S{seg_i}) → 合并段 {merged_segs}, 共 {len(collected_idxs)} 帖 idxs={collected_idxs}")
-
-    total_posts = sum(len(s) for s in target_segs)
-    print(f"  合并完: {len(target_segs)} 段, 共 {total_posts} 帖 (AI 调用 {ai_calls[0]} 次, 对比全扫 {len(day_items)} 次)")
-
-    # 6. 每段 = 1 个产品 (白图切段 + 同款合并已确认段内全是同一件商品的素材, 不再拆)
-    all_groups = target_segs
-    if cache_dir.exists():
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        seg = next((s for s in segments if anchor_idx in s), [anchor_idx])
+        if seg[0] in seen: continue
+        seen.add(seg[0])
+        all_groups.append([day_items[i] for i in seg])
 
     print(f"  → 分成 {len(all_groups)} 个产品:")
     for gi, g in enumerate(all_groups, 1):
