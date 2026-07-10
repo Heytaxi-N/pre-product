@@ -233,18 +233,41 @@ def download_product_images(product_items, tmp_dir):
 # ── AI 分类 ───────────────────────────────────────────
 CATEGORIES = ["合图", "价格图", "产品包装图", "模特图", "官方介绍图", "细节图", "尺码表", "其他"]
 
-def classify_images_ai(ai_config, image_paths):
+# 常见服饰颜色词(复合色在前, 便于优先匹配整词)
+COLOR_WORDS = [
+    "岩灰绿", "雾霾蓝", "克莱因蓝", "藏青", "墨绿", "军绿", "橄榄绿", "牛仔蓝", "浅蓝", "深蓝",
+    "浅灰", "深灰", "浅绿", "深绿", "米白", "米色", "杏色", "驼色", "卡其", "咖啡", "焦糖",
+    "奶茶", "香槟", "裸粉", "豆沙", "酒红", "枣红", "姜黄",
+    "黑色", "白色", "灰色", "红色", "橙色", "黄色", "绿色", "蓝色", "紫色", "粉色", "棕色", "银色", "金色",
+    "黑", "白", "灰", "红", "橙", "黄", "绿", "青", "蓝", "紫", "粉", "棕", "米", "驼",
+]
+
+def extract_colors(text):
+    """从文案抽出出现过的颜色词(复合色优先, 去掉被包含的子词)。用于约束按色分组, 减少 AI 过度细分。
+    ponytail: 词表启发式; 漏词就在 COLOR_WORDS 里补。"""
+    found = []
+    for w in COLOR_WORDS:
+        if w in (text or "") and not any((w in f or f in w) for f in found):
+            found.append(w)
+    return found
+
+def classify_images_ai(ai_config, image_paths, palette=None):
     """OpenAI 兼容视觉 API: 返回 [(path, category, score, color), ...]
     score: 合图/模特图 1-5(选封面/挑最佳), 其它类 0.
     color: 服装主色简称, 只用于细节图按色分组; 不适用为空串.
-    """
+    palette: 文案里抽出的颜色列表, 非空时约束 AI 只能从中选色(避免把2个色判成4个)。"""
     base_url = (ai_config or {}).get("base_url", "").rstrip("/")
     api_key = (ai_config or {}).get("api_key", "")
     model = (ai_config or {}).get("model", "qwen3-vl-flash")
     if not api_key or not base_url:
         print("  ⚠ 未配置 ai_vision, 跳过 AI 分类")
-        return [(p, "其他", 0) for p in image_paths]
+        return [(p, "其他", 0, "") for p in image_paths]
 
+    if palette:
+        color_line = ("color: 该商品文案里的颜色只有[" + "/".join(palette)
+                      + "], 请从中选该图最接近的一个填入;实在都不像才给空串")
+    else:
+        color_line = "color: 该图服装的主色简称(如 白/黑/灰/岩灰绿/卡其/藏青),看不清或不适用给空串"
     prompt = (
         "这是服装产品图,请严格分类。只回复 JSON,格式: {\"cat\":\"类别\",\"score\":数字,\"color\":\"主色\"}\n"
         "类别按优先级判断:\n"
@@ -258,7 +281,7 @@ def classify_images_ai(ai_config, image_paths):
         "8) 其他: 都不符合(如封面海报/纯背景图/无关配图)\n"
         "重要:只有多色平铺挂拍才算合图,单色整件归细节图;带整段文字说明的官方图优先归官方介绍图;主体是包装物的归产品包装图;吊牌归细节图不归价格图。\n"
         "score: 仅当 cat=合图 或 模特图 时给 1-5 分(实拍、清晰、美观、整件可见/信息量大越高);其它类均为 0\n"
-        "color: 该图服装的主色简称(如 白/黑/灰/岩灰绿/卡其/藏青),看不清或不适用给空串"
+        + color_line
     )
 
     results = []
@@ -291,6 +314,9 @@ def classify_images_ai(ai_config, image_paths):
                 cat = "其他"
             score = int(parsed.get("score", 0) or 0)
             color = str(parsed.get("color", "") or "").strip()
+            # 兜底: AI 若没照调色板返回, 就近吸附到文案里的颜色
+            if palette and color and color not in palette:
+                color = next((c for c in palette if c in color or color in c), color)
             results.append((img_path, cat, score, color))
             tag = f"[{cat}" + (f" 分{score}" if cat in ("合图", "模特图") else "") \
                 + (f" {color}" if cat == "细节图" and color else "") + "]"
@@ -521,21 +547,180 @@ def filter_new_items(album_id, raw_items, progress):
     return [it for it in raw_items if _item_date(it) > last_date]
 
 
+def _img_data_url(p):
+    mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(p.read_bytes()).decode()}"
+
+
+VIDEO_EXTS = (".mp4", ".mov", ".avi")
+
+def build_classify_preview_html(supplier_name, prepared, out_path):
+    """排序预览: 按 AI 排好的顺序展示每张图, 拖拽重排 + 删除 + 标记尺码表。
+    导出 分类确认.json = {supplier, prods:[{order:[存活id新序], sizes:[标为尺码表的id]}]}。
+    prepared 每项含 sorted_imgs:[(path,cat,score,color)] (已排好序)。"""
+    prods = []
+    for pr in prepared:
+        imgs = []
+        for j, t in enumerate(pr["sorted_imgs"]):
+            is_vid = t[1] == "视频" or t[0].suffix.lower() in VIDEO_EXTS
+            imgs.append({"id": j, "cat": t[1], "video": is_vid, "sz": t[1] == "尺码表",
+                         "thumb": "" if is_vid else _img_data_url(t[0])})
+        prods.append({"gi": pr["gi"], "time": pr["latest_time"], "imgs": imgs})
+    payload = json.dumps({"supplier": supplier_name, "prods": prods}, ensure_ascii=False)
+    html = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>排序预览</title>
+<style>
+body{font-family:-apple-system,sans-serif;margin:0;background:#f5f5f7;color:#1d1d1f}
+header{position:sticky;top:0;background:#fff;padding:12px 16px;box-shadow:0 1px 4px rgba(0,0,0,.1);z-index:10;display:flex;justify-content:space-between;align-items:center}
+h2{margin:0;font-size:16px}
+#confirm{background:#0071e3;color:#fff;border:0;border-radius:20px;padding:8px 22px;font-size:14px;cursor:pointer}
+.hint{font-size:12px;color:#888;margin:4px 16px;line-height:1.5}
+.prod{background:#fff;border-radius:12px;margin:12px 16px;overflow:hidden;border:2px solid #e5e5ea}
+.prodhead{padding:8px 12px;font-weight:600;font-size:13px;background:#f0f7ff;color:#0071e3}
+.cards{display:flex;flex-wrap:wrap;gap:10px;padding:12px;min-height:80px}
+.card{width:130px;position:relative;border:2px solid transparent;border-radius:10px}
+.card.sz{border-color:#ff9500}
+.card img,.card .vid{width:130px;height:130px;border-radius:8px;background:#eee;display:block}
+.card img{object-fit:cover;cursor:grab}
+.card .vid{display:flex;align-items:center;justify-content:center;flex-direction:column;color:#888;font-size:13px;background:#ececf0;cursor:grab}
+.card.drag{opacity:.35}
+.num{position:absolute;top:5px;left:5px;background:#0071e3;color:#fff;font-size:11px;border-radius:10px;padding:1px 7px;font-weight:600}
+.del{position:absolute;top:4px;right:4px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;line-height:22px;padding:0;cursor:pointer}
+.del:hover{background:#d32f2f}
+.cat{font-size:10px;color:#777;text-align:center;margin-top:3px}
+.szbtn{display:block;width:100%;margin-top:3px;border:1px solid #ddd;border-radius:6px;background:#fafafa;font-size:11px;padding:2px;cursor:pointer}
+.card.sz .szbtn{background:#ff9500;color:#fff;border-color:#ff9500}
+</style></head><body>
+<header><h2>🖼️ 排序预览 — 拖动排序 · × 删图</h2><button id="confirm">✅ 完成并生成</button></header>
+<div class="hint">图片已按 AI 建议排好。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br>某张是<b>尺码表</b>但 AI 没认出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
+<div id="app"></div>
+<script>
+const D=__PAYLOAD__;
+const app=document.getElementById('app');
+let dragEl=null;
+function renumber(box){[...box.children].forEach((c,i)=>{const n=c.querySelector('.num');if(n)n.textContent=i+1;});}
+D.prods.forEach(pr=>{
+  const box=document.createElement('div');box.className='prod';
+  box.innerHTML='<div class="prodhead">产品 '+pr.gi+' · '+pr.time+'</div>';
+  const cards=document.createElement('div');cards.className='cards';
+  pr.imgs.forEach(im=>{
+    const c=document.createElement('div');c.className='card'+(im.sz?' sz':'');c.draggable=true;c.dataset.id=im.id;
+    const media=im.video?'<div class="vid">🎬<br>视频</div>':'<img draggable="false" src="'+im.thumb+'">';
+    c.innerHTML='<span class="num"></span><button class="del">×</button>'+media+'<div class="cat">'+im.cat+'</div><button class="szbtn">尺码表</button>';
+    c.querySelector('.del').onclick=()=>{c.remove();renumber(cards);};
+    c.querySelector('.szbtn').onclick=()=>{c.classList.toggle('sz');};
+    c.addEventListener('dragstart',e=>{dragEl=c;c.classList.add('drag');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','');});
+    c.addEventListener('dragend',()=>{c.classList.remove('drag');dragEl=null;renumber(cards);});
+    cards.appendChild(c);
+  });
+  // 容器级 dragover: 先锁定光标所在行(y 落在卡片上下范围内), 行内按 x 找插入点;
+  // 光标在行间空隙时退回 2D 最近命中。按卡片中点左/右决定插到前面还是后面。
+  // 适配 flex-wrap 网格, 可拖到任意位置(不再只落行首/行尾)。
+  cards.addEventListener('dragover',e=>{
+    e.preventDefault();
+    if(!dragEl||dragEl.parentNode!==cards)return;
+    const els=[...cards.querySelectorAll('.card:not(.drag)')];
+    const row=els.filter(el=>{const r=el.getBoundingClientRect();return e.clientY>=r.top&&e.clientY<=r.bottom;});
+    const pool=row.length?row:els, sameRow=row.length>0;
+    let best=null,bd=Infinity,after=false;
+    for(const el of pool){
+      const r=el.getBoundingClientRect();
+      const cx=r.left+r.width/2, cy=r.top+r.height/2;
+      const d=sameRow?Math.abs(e.clientX-cx):Math.hypot(e.clientX-cx,e.clientY-cy);
+      if(d<bd){bd=d;best=el;after=e.clientX>cx;}
+    }
+    const ref=best?(after?best.nextSibling:best):null;
+    if(ref!==dragEl&&ref!==dragEl.nextSibling)cards.insertBefore(dragEl,ref);
+    renumber(cards);
+  });
+  box.appendChild(cards);app.appendChild(box);renumber(cards);
+});
+document.getElementById('confirm').onclick=()=>{
+  const prods=[...app.querySelectorAll('.cards')].map(box=>({
+    order:[...box.children].map(c=>+c.dataset.id),
+    sizes:[...box.children].filter(c=>c.classList.contains('sz')).map(c=>+c.dataset.id)
+  }));
+  const blob=new Blob([JSON.stringify({supplier:D.supplier,prods:prods})],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='分类确认.json';
+  document.body.appendChild(a);a.click();
+  alert('已下载 分类确认.json — 回到终端继续');
+};
+</script></body></html>"""
+    out_path.write_text(html.replace("__PAYLOAD__", payload), encoding="utf-8")
+
+
+def _open_in_browser(path):
+    """尽量自动弹出本地 HTML: macOS 用 open, 其它退回 webbrowser。"""
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            subprocess.run(["open", str(path)], check=False)
+            return
+    except Exception:
+        pass
+    try:
+        import webbrowser
+        webbrowser.open(Path(path).as_uri())
+    except Exception:
+        pass
+
+
+def wait_for_classify_review(supplier_name, prepared, timeout=600):
+    """弹排序预览, 等 分类确认.json。返回 orders(按 prepared 顺序的存活id列表)或 None(超时/取消→按 AI 顺序)。"""
+    out = SCRIPT_DIR / "分类预览.html"
+    build_classify_preview_html(supplier_name, prepared, out)
+    # 清残留, 避免 Chrome 把新文件改名成 分类确认 (1).json
+    for p in (Path.home() / "Downloads").glob("分类确认*.json"):
+        try: p.unlink()
+        except Exception: pass
+    _open_in_browser(out)
+    print(f"\n🖼️  已弹出排序预览(自动打开): {out}")
+    print(f"   拖动排序 / × 删图 → 点「完成并生成」(最长 {timeout} 秒)")
+    print(f"   直接关掉网页 = 按 AI 排好的顺序生成")
+    start = time.time() - 1
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            time.sleep(1)
+            p = pick_newest_download("分类确认")
+            if p and p.stat().st_mtime > start:
+                s1 = p.stat().st_size; time.sleep(0.5)
+                if p.stat().st_size != s1:
+                    continue
+                try:
+                    prods = json.loads(p.read_text()).get("prods")
+                    p.unlink()
+                    print("  ✓ 收到排序确认, 应用人工调整")
+                    return prods
+                except Exception as e:
+                    print(f"  ⚠ 分类确认读失败({e}), 按 AI 顺序")
+                    return None
+    except KeyboardInterrupt:
+        print("\n  已跳过, 按 AI 顺序")
+    print("  超时, 按 AI 顺序")
+    return None
+
+
 def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
-                   advance_progress=True):
-    """按给定分组处理: 下载→分类→排序→飞书→建文件夹. 返回产品数.
-    advance_progress=False 时不推进按天进度(定向/批量下载用)."""
+                   advance_progress=True, review=None):
+    """按给定分组处理: 下载→去重→分类→排序→(可选拖拽/删图)→飞书→建文件夹. 返回产品数.
+    advance_progress=False 时不推进按天进度(定向/批量下载用).
+    review=None: 按环境变量 SKIP_REVIEW 决定, 默认弹排序预览; run 自动化传 review=False。"""
     if MAX_PRODUCTS > 0:
         groups = groups[:MAX_PRODUCTS]
+    if review is None:
+        review = os.environ.get("SKIP_REVIEW", "") not in ("1", "true", "yes")
+
+    # Phase A: 下载 → 去重 → 分类 → 排序, 暂存(临时目录先不删)
+    prepared = []
     for gi, group in enumerate(groups, 1):
         group_asc = sorted(group, key=lambda x: x["time_stamp"])
         latest_time = datetime.fromtimestamp(group[-1]["time_stamp"] / 1000).strftime("%Y-%m-%d %H:%M")
         print(f"\n─ 产品 {gi}/{len(groups)} ({len(group)} 帖, {latest_time})")
-
         texts = [it["title"] for it in group_asc if it.get("title")]
         combined_text = "\n\n---\n\n".join(texts) if texts else "(无文案)"
         print(f"  文案: {combined_text[:60]}...")
-
         tmp_dir = TMP_ROOT / f"tmp_{album_id[-8:]}_{gi}"
         images = download_product_images(group_asc, tmp_dir)
         if not images:
@@ -551,33 +736,71 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
             seen_h.add(h); uniq.append(p)
         if len(uniq) < len(images):
             print(f"  去重: {len(images)} → {len(uniq)} 张")
-        images = uniq
-        print(f"  下载 {len(images)} 张")
-
-        classified = classify_images_ai(ai_cfg, images)
+        print(f"  下载 {len(uniq)} 张")
+        # 颜色优先按文案判(2个色就分2类), 文案没有再交给 AI 看图
+        palette = extract_colors(combined_text)
+        if palette:
+            print(f"  文案颜色: {'/'.join(palette)}")
+        classified = classify_images_ai(ai_cfg, uniq, palette=palette)
         sorted_imgs = sort_by_new_rule(classified)
-        print("  排序:")
-        for i, (p, cat, *_rest) in enumerate(sorted_imgs, 1):
-            print(f"    {i:2d}. [{cat}{' 封面' if i == 1 and cat == '合图' else ''}] {p.name}")
+        prepared.append({"gi": gi, "latest_time": latest_time, "combined_text": combined_text,
+                         "tmp_dir": tmp_dir, "sorted_imgs": sorted_imgs, "final": sorted_imgs})
+    if not prepared:
+        return 0
 
-        folder_name = f"{supplier_name}_{latest_time.replace(' ', '_').replace(':', '')}_{gi}"
+    # Phase A.5: 拖拽/删图/标尺码表 确认。edits 按 prepared 顺序, 每项 {order:[存活id], sizes:[标尺码表的id]}
+    if review:
+        edits = wait_for_classify_review(supplier_name, prepared)
+        if edits:
+            for pr, ed in zip(prepared, edits):
+                si = pr["sorted_imgs"]
+                sizes = set(ed.get("sizes", []))
+                final = []
+                for i in ed.get("order", []):
+                    if not (0 <= i < len(si)):
+                        continue
+                    path, cat, score, color = si[i]
+                    is_vid = cat == "视频" or path.suffix.lower() in VIDEO_EXTS
+                    # 命名只认 尺码表/视频; 标记优先, 取消标记的旧尺码表回落成普通图
+                    if i in sizes:
+                        cat = "尺码表"
+                    elif is_vid:
+                        cat = "视频"
+                    elif cat == "尺码表":
+                        cat = "细节图"
+                    final.append((path, cat, score, color))
+                pr["final"] = final
+
+    # Phase B: 飞书 → 建文件夹
+    n = 0
+    for pr in prepared:
+        final = pr["final"]
+        if not final:
+            print(f"\n─ 产品 {pr['gi']}: 图片被全部删除, 跳过")
+            if pr["tmp_dir"].exists():
+                shutil.rmtree(pr["tmp_dir"])
+            continue
+        print(f"\n─ 产品 {pr['gi']} 最终 {len(final)} 张:")
+        for i, (p, cat, *_rest) in enumerate(final, 1):
+            print(f"    {i:2d}. [{cat}{' 封面' if i == 1 and cat == '合图' else ''}] {p.name}")
+        folder_name = f"{supplier_name}_{pr['latest_time'].replace(' ', '_').replace(':', '')}_{pr['gi']}"
         if feishu:
             try:
-                record_id = feishu.create_record({fs_cfg.get("info_field", "信息"): combined_text})
+                record_id = feishu.create_record({fs_cfg.get("info_field", "信息"): pr["combined_text"]})
                 print(f"  ✓ 飞书记录已创建: {record_id}")
                 folder_name = feishu.wait_for_field(record_id, fs_cfg.get("img_name_field", "图片名"))
                 print(f"  ✓ 图片名: {folder_name}")
             except Exception as e:
                 print(f"  ⚠ 飞书失败, 用默认文件夹名: {e}")
-
-        folder = create_product_folder(sorted_imgs, folder_name, OUTPUT_DIR)
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+        create_product_folder(final, folder_name, OUTPUT_DIR)
+        if pr["tmp_dir"].exists():
+            shutil.rmtree(pr["tmp_dir"])
+        n += 1
 
     if groups and advance_progress:
         progress[album_id] = max(_item_date(it) for group in groups for it in group)
         save_json(PROGRESS_FILE, progress)
-    return len(groups)
+    return n
 
 
 def apply_code_filter(items, code):
@@ -601,7 +824,7 @@ def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cf
     groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}")
     print(f"  分为 {len(groups)} 个产品")
     return process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
-                          advance_progress=not code)
+                          advance_progress=not code, review=False)
 
 
 # ── 预览确认界面 ──────────────────────────────────────
