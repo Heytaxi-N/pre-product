@@ -529,6 +529,10 @@ def select_suppliers(available):
 def _item_date(it):
     return datetime.fromtimestamp(it["time_stamp"] / 1000).strftime("%Y-%m-%d")
 
+def _item_order(it):
+    """页面编排顺序使用 update_time; 旧抓取数据回退到发布时间."""
+    return it.get("update_time") or it["time_stamp"]
+
 def _progress_date(progress, album_id):
     """取上次处理到的日期串. 兼容旧格式(int 毫秒时间戳)."""
     v = progress.get(album_id)
@@ -1033,8 +1037,8 @@ def _normalize_date(date_str):
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
     return date_str.strip()  # 无法识别, 原样返回
 
-def _data_has_date(scrape_path, config, supplier_name, date_str):
-    """检查 scrape 里指定供货商指定日期是否有内容."""
+def _data_has_date(scrape_path, config, supplier_name, date_str, require_order=True):
+    """检查 scrape 里是否有目标日期内容, 默认同时要求页面排序字段."""
     p = Path(scrape_path)
     if not p.exists():
         return False
@@ -1050,10 +1054,8 @@ def _data_has_date(scrape_path, config, supplier_name, date_str):
                 aid = a; break
     if not aid or aid not in d:
         return False
-    for it in d[aid].get("items", []):
-        if _item_date(it) == date_str:
-            return True
-    return False
+    matches = [it for it in d[aid].get("items", []) if _item_date(it) == date_str]
+    return bool(matches) and (not require_order or all(it.get("update_time") for it in matches))
 
 def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
     """深挖来的单供货商 JSON merge 到主 scrape_all.json.
@@ -1069,12 +1071,15 @@ def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
             raw = {"data": {}}
     else:
         raw = {"data": {}}
-    # 已有该 aid 的 items 按 goods_id 去重合并
+    # 已有该 aid 的 items 按 goods_id 刷新, 补齐 update_time 等深挖字段.
     existing = raw["data"].get(aid, {"supplier": anchor.get("supplier", ""), "items": []})
-    seen = {it["goods_id"] for it in existing["items"]}
+    by_id = {it["goods_id"]: it for it in existing["items"]}
     for it in items:
-        if it["goods_id"] not in seen:
-            existing["items"].append(it); seen.add(it["goods_id"])
+        old = by_id.get(it["goods_id"])
+        if old is not None:
+            old.update(it)
+        else:
+            existing["items"].append(it); by_id[it["goods_id"]] = it
     existing["supplier"] = anchor.get("supplier") or existing.get("supplier", "")
     raw["data"][aid] = existing
     Path(scrape_path).write_text(json.dumps(raw, ensure_ascii=False, indent=2))
@@ -1154,6 +1159,10 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                     if _data_has_date(scrape_path, config, supplier_name, date_str):
                         print("✓ merge 后已含目标日期数据")
                         return True
+                    elif _data_has_date(scrape_path, config, supplier_name, date_str,
+                                        require_order=False):
+                        print("⚠ 深挖数据缺少 update_time, 请重新运行 bookmark 并替换旧书签")
+                        return False
                     else:
                         print(f"⚠ 深挖翻完了仍没抓到 {date_str}(供货商可能真没在这天上新)")
                         return False
@@ -1165,6 +1174,10 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                 if _data_has_date(scrape_path, config, supplier_name, date_str):
                     print("✓ 全量数据里有目标日期")
                     return True
+                elif _data_has_date(scrape_path, config, supplier_name, date_str,
+                                    require_order=False):
+                    print("⚠ 抓取数据缺少 update_time, 请重新运行 bookmark 并替换旧书签")
+                    all_dl_orig_mtime = all_new.stat().st_mtime
                 else:
                     print(f"⚠ 全量抓完仍没有 {date_str}, 请点带深挖的书签(URL 里带 anchor 参数)")
                     all_dl_orig_mtime = all_new.stat().st_mtime  # 记录已看过
@@ -1174,7 +1187,7 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
 
 
 def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
-    """锚点定向: 供货商 + 日期 + title 含关键词 → 找到匹配条目 → 前后到占位图为止 → 处理.
+    """锚点定向: 供货商 + 日期 + title 含关键词 → 锚点前后最近占位图间的素材 → 处理.
     不推进进度.
     date_str 支持 'MM-DD' 或 'YYYY-MM-DD'. 前者补当前年份.
     """
@@ -1195,10 +1208,10 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
     date_str = _normalize_date(date_str)
     print(f"锚点定位: 供货商={supplier_name} 日期={date_str} 关键词=「{keyword}」")
 
-    # 3. 该日期条目, 按时间升序
+    # 3. 该日期条目, 按页面编排时间升序
     day_items = sorted(
         [it for it in data[aid]["items"] if _item_date(it) == date_str],
-        key=lambda x: x["time_stamp"])
+        key=_item_order)
     if not day_items:
         print(f"❌ 该日期无内容"); return
     print(f"  当日 {len(day_items)} 帖")
@@ -1209,9 +1222,8 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
         print(f"❌ 没有 title 含「{keyword}」的条目"); return
     print(f"  匹配锚点 {len(matched_ids)} 条")
 
-    # 5. 结构性白图切段. 用户模型: 一个产品被两张白色占位图包起来,
-    #    占位图 = 只有 1 张图 且 无任何文案. 锚点所在段(两白图之间的整段)
-    #    就是该产品的全部素材(含各色号/模特/细节帖), 纯结构判定, 不需要 AI.
+    # 5. 占位图 = 只有 1 张图 且 无任何文案.
+    #    锚点前后最近的占位图就是该产品边界.
     ai_cfg = config.get("ai_vision") or {}
     matched_indices = [i for i, it in enumerate(day_items) if it["goods_id"] in matched_ids]
 
@@ -1219,26 +1231,28 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
         imgs = item.get("imgsSrc") or []
         return len(imgs) == 1 and not (item.get("title") or "").strip()
 
-    # 5a. 用白图把当日切成段(白图本身不属于任何段)
-    placeholders = {i for i, it in enumerate(day_items) if _is_struct_placeholder(it)}
-    segments = []
-    cur = []
-    for i in range(len(day_items)):
-        if i in placeholders:
-            if cur: segments.append(cur); cur = []
-        else:
-            cur.append(i)
-    if cur: segments.append(cur)
-    print(f"  当日按白图切成 {len(segments)} 段, 白图 {len(placeholders)} 张")
+    placeholder_indices = [i for i, it in enumerate(day_items) if _is_struct_placeholder(it)]
+    print(f"  当日识别占位图 {len(placeholder_indices)} 张")
 
-    # 6. 锚点所在段 = 一个产品 (多个锚点落在同段只算一次)
-    all_groups = []
-    seen = set()
+    # 6. 找锚点前后最近的占位图; 同一边界的多个锚点只处理一次.
+    groups_by_bounds = {}
     for anchor_idx in matched_indices:
-        seg = next((s for s in segments if anchor_idx in s), [anchor_idx])
-        if seg[0] in seen: continue
-        seen.add(seg[0])
-        all_groups.append([day_items[i] for i in seg])
+        before = [i for i in placeholder_indices if i < anchor_idx]
+        after = [i for i in placeholder_indices if i > anchor_idx]
+        if not before or not after:
+            print(f"  ⚠ 锚点 #{anchor_idx} 前后找不到完整占位图, 跳过")
+            continue
+        opening, closing = before[-1], after[0]
+        groups_by_bounds.setdefault((opening, closing), []).append(anchor_idx)
+
+    all_groups = []
+    for (opening, closing), anchor_indices in groups_by_bounds.items():
+        selected = list(range(opening + 1, closing))
+        all_groups.append([day_items[i] for i in selected])
+        print(f"    边界 #{opening}..#{closing}: 锚点 {len(anchor_indices)} 帖, 素材 {len(selected)} 帖")
+
+    if not all_groups:
+        print("❌ 没有找到被两张占位图包住的锚点素材"); return
 
     print(f"  → 分成 {len(all_groups)} 个产品:")
     for gi, g in enumerate(all_groups, 1):
@@ -1304,7 +1318,7 @@ def cmd_install_bookmark(config):
     # 书签的 javascript: URL — 编码为 URI 保证在 href 里合法
     bookmarklet_body = r"""(async()=>{
 const SUP=__SUPPLIERS__;
-const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,videoUrl:it.videoUrl||it.videoURL||''});
+const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,update_time:it.update_time||it.time_stamp,videoUrl:it.videoUrl||it.videoURL||''});
 const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id).map(clean);
 const fetchOne=async(aid,pageTs,dateFilter)=>{
   const ds=dateFilter||'';const de=dateFilter||'';

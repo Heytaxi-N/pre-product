@@ -44,6 +44,7 @@ class BookmarkletTests(unittest.TestCase):
                     body,
                 )
                 self.assertIn("&timestamp=", body)
+                self.assertIn("update_time", body)
                 self.assertNotIn("×tamp=", body)
             finally:
                 pick_products.BOOKMARKLET_FILE = original_file
