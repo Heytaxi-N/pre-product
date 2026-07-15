@@ -252,7 +252,7 @@ def extract_colors(text):
     return found
 
 def classify_images_ai(ai_config, image_paths, palette=None):
-    """OpenAI 兼容视觉 API: 返回 [(path, category, score, color), ...]
+    """OpenAI 兼容视觉 API: 返回 [(path, category, score, color), ...], API 不可用时返回 None.
     score: 合图/模特图 1-5(选封面/挑最佳), 其它类 0.
     color: 服装主色简称, 只用于细节图按色分组; 不适用为空串.
     palette: 文案里抽出的颜色列表, 非空时约束 AI 只能从中选色(避免把2个色判成4个)。"""
@@ -260,8 +260,8 @@ def classify_images_ai(ai_config, image_paths, palette=None):
     api_key = (ai_config or {}).get("api_key", "")
     model = (ai_config or {}).get("model", "qwen3-vl-flash")
     if not api_key or not base_url:
-        print("  ⚠ 未配置 ai_vision, 跳过 AI 分类")
-        return [(p, "其他", 0, "") for p in image_paths]
+        print("  ⚠ 未配置 ai_vision, 按原始时间顺序处理")
+        return None
 
     if palette:
         color_line = ("color: 该商品文案里的颜色只有[" + "/".join(palette)
@@ -322,8 +322,8 @@ def classify_images_ai(ai_config, image_paths, palette=None):
                 + (f" {color}" if cat == "细节图" and color else "") + "]"
             print(f"    {img_path.name} → {tag}")
         except Exception as e:
-            print(f"    {img_path.name} → 分类失败({e}), 归为其他")
-            results.append((img_path, "其他", 0, ""))
+            print(f"    {img_path.name} → 分类失败({e}), 全部按原始时间顺序处理")
+            return None
         time.sleep(0.15)
 
     return results
@@ -597,7 +597,7 @@ h2{margin:0;font-size:16px}
 .card.sz .szbtn{background:#ff9500;color:#fff;border-color:#ff9500}
 </style></head><body>
 <header><h2>🖼️ 排序预览 — 拖动排序 · × 删图</h2><button id="confirm">✅ 完成并生成</button></header>
-<div class="hint">图片已按 AI 建议排好。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br>某张是<b>尺码表</b>但 AI 没认出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
+<div class="hint">图片按当前处理顺序展示。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br>某张是<b>尺码表</b>但没识别出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
 <div id="app"></div>
 <script>
 const D=__PAYLOAD__;
@@ -671,7 +671,7 @@ def _open_in_browser(path):
 
 
 def wait_for_classify_review(supplier_name, prepared, timeout=600):
-    """弹排序预览, 等 分类确认.json。返回 orders(按 prepared 顺序的存活id列表)或 None(超时/取消→按 AI 顺序)。"""
+    """弹排序预览, 等 分类确认.json。返回 orders(按 prepared 顺序的存活id列表)或 None。"""
     out = SCRIPT_DIR / "分类预览.html"
     build_classify_preview_html(supplier_name, prepared, out)
     # 清残留, 避免 Chrome 把新文件改名成 分类确认 (1).json
@@ -681,7 +681,7 @@ def wait_for_classify_review(supplier_name, prepared, timeout=600):
     _open_in_browser(out)
     print(f"\n🖼️  已弹出排序预览(自动打开): {out}")
     print(f"   拖动排序 / × 删图 → 点「完成并生成」(最长 {timeout} 秒)")
-    print(f"   直接关掉网页 = 按 AI 排好的顺序生成")
+    print(f"   直接关掉网页 = 按当前预览顺序生成")
     start = time.time() - 1
     end = time.time() + timeout
     try:
@@ -698,11 +698,11 @@ def wait_for_classify_review(supplier_name, prepared, timeout=600):
                     print("  ✓ 收到排序确认, 应用人工调整")
                     return prods
                 except Exception as e:
-                    print(f"  ⚠ 分类确认读失败({e}), 按 AI 顺序")
+                    print(f"  ⚠ 分类确认读失败({e}), 按当前顺序")
                     return None
     except KeyboardInterrupt:
-        print("\n  已跳过, 按 AI 顺序")
-    print("  超时, 按 AI 顺序")
+        print("\n  已跳过, 按当前顺序")
+    print("  超时, 按当前顺序")
     return None
 
 
@@ -720,7 +720,7 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
     prepared = []
     for gi, group in enumerate(groups, 1):
         group_asc = sorted(group, key=lambda x: x["time_stamp"])
-        latest_time = datetime.fromtimestamp(group[-1]["time_stamp"] / 1000).strftime("%Y-%m-%d %H:%M")
+        latest_time = datetime.fromtimestamp(group_asc[-1]["time_stamp"] / 1000).strftime("%Y-%m-%d %H:%M")
         print(f"\n─ 产品 {gi}/{len(groups)} ({len(group)} 帖, {latest_time})")
         texts = [it["title"] for it in group_asc if it.get("title")]
         combined_text = "\n\n---\n\n".join(texts) if texts else "(无文案)"
@@ -746,7 +746,13 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         if palette:
             print(f"  文案颜色: {'/'.join(palette)}")
         classified = classify_images_ai(ai_cfg, uniq, palette=palette)
-        sorted_imgs = sort_by_new_rule(classified)
+        if classified is None:
+            sorted_imgs = [
+                (p, "视频" if p.suffix.lower() in VIDEO_EXTS else "其他", 0, "")
+                for p in uniq
+            ]
+        else:
+            sorted_imgs = sort_by_new_rule(classified)
         prepared.append({"gi": gi, "latest_time": latest_time, "combined_text": combined_text,
                          "tmp_dir": tmp_dir, "sorted_imgs": sorted_imgs, "final": sorted_imgs})
     if not prepared:
@@ -824,11 +830,15 @@ def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cf
     if not items:
         print("  没有新内容")
         return 0
-    print(f"  AI 分组中 ({len(items)} 帖)...")
-    groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}")
+    if code:
+        groups = [sorted(items, key=lambda x: x["time_stamp"])]
+        print(f"  同一编码按 1 个产品处理 ({len(items)} 帖, 从旧到新)")
+    else:
+        print(f"  AI 分组中 ({len(items)} 帖)...")
+        groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}")
     print(f"  分为 {len(groups)} 个产品")
     return process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
-                          advance_progress=not code, review=False)
+                          advance_progress=not code, review=bool(code))
 
 
 # ── 预览确认界面 ──────────────────────────────────────
@@ -1057,6 +1067,23 @@ def _data_has_date(scrape_path, config, supplier_name, date_str, require_order=T
     matches = [it for it in d[aid].get("items", []) if _item_date(it) == date_str]
     return bool(matches) and (not require_order or all(it.get("update_time") for it in matches))
 
+
+def _data_has_code(scrape_path, config, supplier_name, code):
+    """检查指定供货商的抓取数据里是否已有目标编码."""
+    p = Path(scrape_path)
+    if not p.exists():
+        return False
+    try:
+        d = load_scrape(str(p), config)
+    except Exception:
+        return False
+    aid = config.get("suppliers", {}).get(supplier_name)
+    if not aid:
+        for n, a in config.get("suppliers", {}).items():
+            if supplier_name in n:
+                aid = a; break
+    return bool(aid and aid in d and apply_code_filter(d[aid].get("items", []), code))
+
 def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
     """深挖来的单供货商 JSON merge 到主 scrape_all.json.
     anchor 格式: {"supplier":.., "albumId":.., "items":[..]}
@@ -1109,21 +1136,24 @@ def pick_newest_download(base):
     return newest
 
 
-def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240):
-    """前置: 确保 scrape 里有 supplier_name 在 date_str 的数据. 缺失则打开带 anchor 参数的 szwego,
+def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code=""):
+    """前置: 确保 scrape 里有指定日期或编码的数据. 缺失则打开带 anchor 参数的 szwego,
     让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
     merge 到本地 scrape_all.json 后再验证.
     """
-    if _data_has_date(scrape_path, config, supplier_name, date_str):
+    has_target = (lambda: _data_has_code(scrape_path, config, supplier_name, code)) if code else (
+        lambda: _data_has_date(scrape_path, config, supplier_name, date_str))
+    target = f"编码「{code}」" if code else date_str
+    if has_target():
         return True
-    print(f"⚠ 本地数据没有 「{supplier_name}」 {date_str} 的内容, 帮你去深挖...")
+    print(f"⚠ 本地数据没有 「{supplier_name}」 {target} 的内容, 帮你去深挖...")
     # 打开带 anchor 参数的 szwego, 书签会读 URL 参数决定行为
     # 参数放 hash 前 (search), 否则 vue router 匹配失败白屏
     anchor_url = (
         "https://www.szwego.com/static/index.html"
-        f"?anchor_supplier={urllib.parse.quote(supplier_name)}"
-        f"&anchor_date={date_str}"
-        "#/album_home"
+        + f"?anchor_supplier={urllib.parse.quote(supplier_name)}"
+        + (f"&anchor_code={urllib.parse.quote(code)}" if code else f"&anchor_date={date_str}")
+        + "#/album_home"
     )
     try:
         import webbrowser
@@ -1156,34 +1186,40 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                 print(f"  ⇣ 收到深挖数据: {anchor_dl}")
                 if _merge_anchor_into_scrape(scrape_path, anchor_dl):
                     anchor_dl.unlink()  # 用完删掉
-                    if _data_has_date(scrape_path, config, supplier_name, date_str):
-                        print("✓ merge 后已含目标日期数据")
+                    if has_target():
+                        print(f"✓ merge 后已找到 {target}")
                         return True
-                    elif _data_has_date(scrape_path, config, supplier_name, date_str,
+                    elif not code and _data_has_date(scrape_path, config, supplier_name, date_str,
                                         require_order=False):
                         print("⚠ 深挖数据缺少 update_time, 请重新运行 bookmark 并替换旧书签")
                         return False
                     else:
-                        print(f"⚠ 深挖翻完了仍没抓到 {date_str}(供货商可能真没在这天上新)")
+                        print(f"⚠ 深挖翻完了仍没找到 {target}")
                         return False
             # 兼容: 用户点了普通书签(不带 anchor 参数抓的全量)
             all_new = pick_newest_download("scrape_all")
             if all_new and all_new.stat().st_mtime > all_dl_orig_mtime and all_new.stat().st_mtime > start_ts:
                 s1 = all_new.stat().st_size; time.sleep(0.5)
                 if all_new.stat().st_size != s1: continue
-                if _data_has_date(scrape_path, config, supplier_name, date_str):
-                    print("✓ 全量数据里有目标日期")
+                if has_target():
+                    print(f"✓ 全量数据里已找到 {target}")
                     return True
-                elif _data_has_date(scrape_path, config, supplier_name, date_str,
+                elif not code and _data_has_date(scrape_path, config, supplier_name, date_str,
                                     require_order=False):
                     print("⚠ 抓取数据缺少 update_time, 请重新运行 bookmark 并替换旧书签")
                     all_dl_orig_mtime = all_new.stat().st_mtime
                 else:
-                    print(f"⚠ 全量抓完仍没有 {date_str}, 请点带深挖的书签(URL 里带 anchor 参数)")
+                    print(f"⚠ 全量抓完仍没找到 {target}, 请点带深挖的书签(URL 里带 anchor 参数)")
                     all_dl_orig_mtime = all_new.stat().st_mtime  # 记录已看过
     except KeyboardInterrupt:
         print("\n已取消")
     print("超时"); return False
+
+
+def ensure_data_for_code(scrape_path, config, supplier_name, code, timeout=240):
+    """确保指定供货商的抓取数据里有目标编码, 否则按供货商逐页深挖."""
+    return ensure_data_for_date(
+        scrape_path, config, supplier_name, "", timeout=timeout, code=code)
 
 
 def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
@@ -1333,22 +1369,24 @@ const dl=(data,fname)=>{
 const params=new URLSearchParams(location.search);
 const anchorSup=params.get('anchor_supplier');
 const anchorDate=params.get('anchor_date');
-if(anchorSup&&anchorDate){
+const anchorCode=params.get('anchor_code');
+if(anchorSup&&(anchorDate||anchorCode)){
   let aid=null,name=anchorSup;
   for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
   if(!aid){alert('未找到供货商: '+anchorSup);return;}
   const all=[];let pageTs='',pages=0;const MAX=15;
   while(pages<MAX){
-    let d;try{d=await fetchOne(aid,pageTs,anchorDate);}catch(e){break;}
+    let d;try{d=await fetchOne(aid,pageTs,anchorDate||'');}catch(e){break;}
     const items=filt(d.result&&d.result.items?d.result.items:[]);
     if(items.length===0)break;
     all.push(...items);pages++;
+    if(anchorCode&&items.some(i=>(i.title||'').includes(anchorCode)))break;
     if(!d.result.pagination||!d.result.pagination.isLoadMore)break;
     pageTs=d.result.pagination.pageTimestamp;
     await new Promise(r=>setTimeout(r,150));
   }
-  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,pages}},'scrape_anchor.json');
-  alert('深挖完成: '+name+' '+anchorDate+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
+  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,pages}},'scrape_anchor.json');
+  alert('深挖完成: '+name+' '+(anchorCode||anchorDate)+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;
 }
 const out={data:{}};let ok=0,err=0;
@@ -1472,6 +1510,10 @@ def main():
         cmd_anchor(config, progress, data, supplier_arg, code_arg, date_arg); return
 
     scrape_path = env_scrape or (str(pick_newest_download("scrape_all") or ""))
+    if mode == "run" and supplier and code:
+        scrape_path = scrape_path or str(default_scrape)
+        if not ensure_data_for_code(scrape_path, config, supplier, code):
+            print(f"❌ 深挖后仍未找到 「{supplier}」 编码「{code}」的素材"); return
     if not scrape_path:
         print(f"❌ 没找到抓取数据: {default_scrape}")
         print(f"   请先在浏览器点「🛒 抓挑品数据」书签抓一次数据。")
@@ -1483,7 +1525,11 @@ def main():
     if mode == "run":
         available = list_available(data, progress, code)
         if not available:
-            print("✓ 没有新内容(所有供货商都已处理到最新)"); return
+            if code:
+                print(f"❌ 没有找到编码「{code}」的素材")
+            else:
+                print("✓ 没有新内容(所有供货商都已处理到最新)")
+            return
         chosen = select_suppliers(available)
         if not chosen:
             print("未选择任何供货商, 退出"); return

@@ -68,7 +68,11 @@ python3 pick_products.py
 python3 pick_products.py run 晨星外贸06 0708d
 ```
 
-定向模式**不推进进度**,下次跑仍能拿到这批。
+定向模式把同一编码的帖子视为一个产品,并弹出「分类预览」供拖拽排序、删图和标记尺码表。它**不推进进度**,下次跑仍能拿到这批。
+
+图像模型未配置、密钥失效或调用异常时,脚本跳过 AI 分类,按帖子发布时间从旧到新、每帖图片原顺序下载,不会因为分类失败丢图。
+
+如果本地 `scrape_all.json` 没有该供货商或找不到编码,脚本会自动打开带定向参数的微购相册页面。点击「🛒 抓挑品数据」书签后,书签只深挖该供货商并逐页查找编码;找到后自动合并数据并继续处理。
 
 ### 锚点定向(找某天某关键词素材,前后到占位图为止)
 
@@ -94,7 +98,7 @@ python3 pick_products.py anchor 南在南方 凯乐石女款裙裤 04-30
 ### 单独入口(给自动化脚本用)
 
 - `python3 pick_products.py bookmark` — 生成/更新书签安装页 + 兜底 console 脚本
-- `python3 pick_products.py run [供货商] [编码]` — 直接跑,不弹预览
+- `python3 pick_products.py run [供货商] [编码]` — 直接跑;带编码时弹分类预览,不带编码时不弹
 - `python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD>` — 锚点定向
 - `python3 pick_products.py process <confirmed.json>` — 只处理已确认的分组文件
 

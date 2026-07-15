@@ -38,13 +38,19 @@ class BookmarkletTests(unittest.TestCase):
                 parser = BookmarkParser()
                 parser.feed(pick_products.BOOKMARKLET_FILE.read_text(encoding="utf-8"))
                 self.assertIsNotNone(parser.href)
-                body = unquote(parser.href.removeprefix("javascript:"))
+                body = unquote(
+                    parser.href[len("javascript:"):]
+                    if parser.href.startswith("javascript:")
+                    else parser.href
+                )
                 self.assertIn(
                     "https://www.szwego.com/album/personal/new",
                     body,
                 )
                 self.assertIn("&timestamp=", body)
                 self.assertIn("update_time", body)
+                self.assertIn("anchor_code", body)
+                self.assertIn("items.some", body)
                 self.assertNotIn("×tamp=", body)
             finally:
                 pick_products.BOOKMARKLET_FILE = original_file

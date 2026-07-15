@@ -1,8 +1,13 @@
 import json
+import io
+import os
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pick_products
 
@@ -114,6 +119,30 @@ class AnchorTests(unittest.TestCase):
                     scrape_path, config, "南在南方", "2026-04-30", require_order=False
                 )
             )
+
+    def test_run_with_missing_code_triggers_targeted_deep_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.json"
+            scrape_path = tmp_path / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"晨星外贸06": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", tmp_path / "progress.json"), \
+                    patch.object(pick_products, "ensure_data_for_code", return_value=False) as deep, \
+                    patch.object(sys, "argv", ["pick_products.py", "run", "晨星外贸06", "0714c"]), \
+                    patch.dict(os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False), \
+                    redirect_stdout(io.StringIO()) as output:
+                pick_products.main()
+
+            deep.assert_called_once_with(
+                str(scrape_path), {"suppliers": {"晨星外贸06": "album-1"}},
+                "晨星外贸06", "0714c")
+            self.assertIn("深挖后仍未找到", output.getvalue())
+            self.assertNotIn("所有供货商都已处理到最新", output.getvalue())
 
 
 if __name__ == "__main__":
