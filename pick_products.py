@@ -558,6 +558,24 @@ def _img_data_url(p):
 
 VIDEO_EXTS = (".mp4", ".mov", ".avi")
 
+
+def _video_frame_data_url(path):
+    """用 ffmpeg 提取视频首帧作为分类预览缩略图; 失败时返回空串."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
+             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return "data:image/jpeg;base64," + base64.b64encode(result.stdout).decode()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    print(f"  ⚠ 视频首帧提取失败: {Path(path).name}")
+    return ""
+
+
 def build_classify_preview_html(supplier_name, prepared, out_path):
     """排序预览: 按 AI 排好的顺序展示每张图, 拖拽重排 + 删除 + 标记尺码表。
     导出 分类确认.json = {supplier, prods:[{order:[存活id新序], sizes:[标为尺码表的id]}]}。
@@ -568,7 +586,8 @@ def build_classify_preview_html(supplier_name, prepared, out_path):
         for j, t in enumerate(pr["sorted_imgs"]):
             is_vid = t[1] == "视频" or t[0].suffix.lower() in VIDEO_EXTS
             imgs.append({"id": j, "cat": t[1], "video": is_vid, "sz": t[1] == "尺码表",
-                         "thumb": "" if is_vid else _img_data_url(t[0])})
+                         "thumb": _video_frame_data_url(t[0]) if is_vid else _img_data_url(t[0]),
+                         "src": t[0].resolve().as_uri() if is_vid else ""})
         prods.append({"gi": pr["gi"], "time": pr["latest_time"], "imgs": imgs})
     payload = json.dumps({"supplier": supplier_name, "prods": prods}, ensure_ascii=False)
     html = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
@@ -585,36 +604,71 @@ h2{margin:0;font-size:16px}
 .cards{display:flex;flex-wrap:wrap;gap:10px;padding:12px;min-height:80px}
 .card{width:130px;position:relative;border:2px solid transparent;border-radius:10px}
 .card.sz{border-color:#ff9500}
-.card img,.card .vid{width:130px;height:130px;border-radius:8px;background:#eee;display:block}
-.card img{object-fit:cover;cursor:grab}
-.card .vid{display:flex;align-items:center;justify-content:center;flex-direction:column;color:#888;font-size:13px;background:#ececf0;cursor:grab}
+.card .media{width:130px;height:130px;border-radius:8px;background:#eee;display:block;object-fit:cover;cursor:grab;overflow:hidden}
+.card .vid{position:relative}
+.card .vid img,.card .vid video{width:100%;height:100%;display:block;object-fit:cover}
+.play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34px;height:34px;border-radius:50%;background:rgba(0,0,0,.58);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;padding-left:2px;box-sizing:border-box}
 .card.drag{opacity:.35}
 .num{position:absolute;top:5px;left:5px;background:#0071e3;color:#fff;font-size:11px;border-radius:10px;padding:1px 7px;font-weight:600}
 .del{position:absolute;top:4px;right:4px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;line-height:22px;padding:0;cursor:pointer}
 .del:hover{background:#d32f2f}
+.preview-btn{position:absolute;right:5px;top:101px;z-index:2;width:24px;height:24px;border:0;border-radius:50%;background:rgba(0,0,0,.58);cursor:pointer}
+.preview-btn:hover{background:#0071e3}
+.preview-btn:before{content:'';position:absolute;left:6px;top:5px;width:7px;height:7px;border:2px solid #fff;border-radius:50%}
+.preview-btn:after{content:'';position:absolute;left:14px;top:14px;width:6px;height:2px;background:#fff;transform:rotate(45deg);transform-origin:left center}
 .cat{font-size:10px;color:#777;text-align:center;margin-top:3px}
 .szbtn{display:block;width:100%;margin-top:3px;border:1px solid #ddd;border-radius:6px;background:#fafafa;font-size:11px;padding:2px;cursor:pointer}
 .card.sz .szbtn{background:#ff9500;color:#fff;border-color:#ff9500}
+#hover-preview{display:none;position:fixed;z-index:100;pointer-events:none;width:min(560px,calc(100vw - 16px));height:min(640px,70vh);padding:8px;box-sizing:border-box;border-radius:8px;background:#111;box-shadow:0 12px 36px rgba(0,0,0,.35);align-items:center;justify-content:center}
+#hover-preview img,#hover-preview video{display:block;max-width:100%;max-height:100%;object-fit:contain}
 </style></head><body>
 <header><h2>🖼️ 排序预览 — 拖动排序 · × 删图</h2><button id="confirm">✅ 完成并生成</button></header>
 <div class="hint">图片按当前处理顺序展示。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br>某张是<b>尺码表</b>但没识别出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
 <div id="app"></div>
+<div id="hover-preview" aria-hidden="true"></div>
 <script>
 const D=__PAYLOAD__;
 const app=document.getElementById('app');
+const hoverPreview=document.getElementById('hover-preview');
 let dragEl=null;
 function renumber(box){[...box.children].forEach((c,i)=>{const n=c.querySelector('.num');if(n)n.textContent=i+1;});}
+function hidePreview(){
+  const video=hoverPreview.querySelector('video');if(video)video.pause();
+  hoverPreview.replaceChildren();hoverPreview.style.display='none';
+}
+function showPreview(im,target){
+  hidePreview();
+  const media=document.createElement(im.video?'video':'img');
+  if(im.video){media.src=im.src;media.muted=true;media.loop=true;media.playsInline=true;media.autoplay=true;}
+  else{media.src=im.thumb;}
+  hoverPreview.appendChild(media);hoverPreview.style.display='flex';
+  const r=target.getBoundingClientRect(),gap=12,w=hoverPreview.offsetWidth,h=hoverPreview.offsetHeight;
+  let left=r.right+gap;if(left+w>innerWidth-8)left=r.left-w-gap;
+  hoverPreview.style.left=Math.max(8,left)+'px';
+  hoverPreview.style.top=Math.max(8,Math.min(r.top,innerHeight-h-8))+'px';
+  if(im.video)media.play().catch(()=>{});
+}
 D.prods.forEach(pr=>{
   const box=document.createElement('div');box.className='prod';
   box.innerHTML='<div class="prodhead">产品 '+pr.gi+' · '+pr.time+'</div>';
   const cards=document.createElement('div');cards.className='cards';
   pr.imgs.forEach(im=>{
     const c=document.createElement('div');c.className='card'+(im.sz?' sz':'');c.draggable=true;c.dataset.id=im.id;
-    const media=im.video?'<div class="vid">🎬<br>视频</div>':'<img draggable="false" src="'+im.thumb+'">';
-    c.innerHTML='<span class="num"></span><button class="del">×</button>'+media+'<div class="cat">'+im.cat+'</div><button class="szbtn">尺码表</button>';
+    const videoThumb=im.thumb?'<img draggable="false" src="'+im.thumb+'">':'<video muted preload="metadata" src="'+im.src+'"></video>';
+    const media=im.video?'<div class="media vid">'+videoThumb+'<span class="play">▶</span></div>':'<img class="media" draggable="false" src="'+im.thumb+'">';
+    c.innerHTML='<span class="num"></span><button class="del">×</button>'+media+'<button class="preview-btn" title="预览" aria-label="预览"></button><div class="cat">'+im.cat+'</div><button class="szbtn">尺码表</button>';
     c.querySelector('.del').onclick=()=>{c.remove();renumber(cards);};
     c.querySelector('.szbtn').onclick=()=>{c.classList.toggle('sz');};
-    c.addEventListener('dragstart',e=>{dragEl=c;c.classList.add('drag');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','');});
+    const previewBtn=c.querySelector('.preview-btn');
+    const showFromButton=()=>{c.draggable=false;showPreview(im,previewBtn);};
+    const hideFromButton=()=>{hidePreview();c.draggable=true;};
+    previewBtn.draggable=false;
+    previewBtn.addEventListener('mouseenter',showFromButton);
+    previewBtn.addEventListener('mouseleave',hideFromButton);
+    previewBtn.addEventListener('focus',showFromButton);
+    previewBtn.addEventListener('blur',hideFromButton);
+    previewBtn.onmousedown=e=>e.stopPropagation();
+    c.addEventListener('dragstart',e=>{hidePreview();dragEl=c;c.classList.add('drag');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','');});
     c.addEventListener('dragend',()=>{c.classList.remove('drag');dragEl=null;renumber(cards);});
     cards.appendChild(c);
   });

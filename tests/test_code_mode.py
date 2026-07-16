@@ -18,6 +18,34 @@ def make_item(goods_id, minute):
 
 
 class CodeModeTests(unittest.TestCase):
+    def test_preview_embeds_video_first_frame_and_hover_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            video = tmp_path / "preview.mp4"
+            video.write_bytes(b"video")
+            output = tmp_path / "preview.html"
+            prepared = [{
+                "gi": 1,
+                "latest_time": "2026-07-15 12:00",
+                "sorted_imgs": [(video, "视频", 0, "")],
+            }]
+
+            with patch.object(
+                pick_products, "_video_frame_data_url",
+                return_value="data:image/jpeg;base64,first-frame",
+            ):
+                pick_products.build_classify_preview_html("测试供货商", prepared, output)
+
+            html = output.read_text()
+            self.assertIn("data:image/jpeg;base64,first-frame", html)
+            self.assertIn(video.resolve().as_uri(), html)
+            self.assertIn('id="hover-preview"', html)
+            self.assertIn("<video", html)
+            self.assertIn("previewBtn.addEventListener('mouseenter'", html)
+            self.assertIn("previewBtn.addEventListener('focus'", html)
+            self.assertIn("c.draggable=false", html)
+            self.assertNotIn("mediaEl.addEventListener('mouseenter'", html)
+
     def test_code_matches_are_one_ordered_product_with_review(self):
         newer = make_item("newer", 2)
         older = make_item("older", 1)
