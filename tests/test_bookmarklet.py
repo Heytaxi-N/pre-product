@@ -50,7 +50,12 @@ class BookmarkletTests(unittest.TestCase):
                 self.assertIn("&timestamp=", body)
                 self.assertIn("update_time", body)
                 self.assertIn("anchor_code", body)
-                self.assertIn("items.some", body)
+                self.assertIn("const MAX=50", body)
+                self.assertIn("incomplete", body)
+                self.assertIn("missesAfterCode", body)
+                self.assertIn("missesAfterCode>=2", body)
+                self.assertIn("stopReason", body)
+                self.assertNotIn("if(anchorCode&&items.some", body)
                 self.assertNotIn("×tamp=", body)
             finally:
                 pick_products.BOOKMARKLET_FILE = original_file

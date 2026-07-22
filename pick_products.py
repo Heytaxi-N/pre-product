@@ -1167,6 +1167,29 @@ def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
     return True
 
 
+def _code_anchor_problem(anchor_json_path, expected_aid, code):
+    """返回本次编码深挖的具体问题; 空串表示可用."""
+    try:
+        anchor = json.loads(Path(anchor_json_path).read_text())
+    except Exception:
+        return "下载文件无法读取"
+    if anchor.get("albumId") != expected_aid:
+        return "下载文件与目标相册不符"
+    meta = anchor.get("anchor") or {}
+    if "incomplete" not in meta:
+        return "仍在使用旧版书签, 请从 install_bookmark.html 重新替换"
+    if meta.get("code") != code:
+        return "下载文件与本次请求编码不符"
+    if meta.get("incomplete"):
+        pages = meta.get("pages", 0)
+        if meta.get("stopReason") == "limit":
+            return f"达到 {pages} 页上限仍未定位完整编码区段"
+        return f"第 {pages} 页附近网络请求中断"
+    if not apply_code_filter(anchor.get("items", []), code):
+        return f"本次深挖没有找到编码「{code}」"
+    return ""
+
+
 def pick_newest_download(base):
     """Downloads 里 base*.json 取 mtime 最新的一个, 删掉其余旧副本,
     把最新的规范化成 base.json 返回其路径; 没有则 None。
@@ -1190,17 +1213,22 @@ def pick_newest_download(base):
     return newest
 
 
-def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code=""):
-    """前置: 确保 scrape 里有指定日期或编码的数据. 缺失则打开带 anchor 参数的 szwego,
+def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code="",
+                         force_fetch=False):
+    """前置: 确保 scrape 里有指定日期或编码的完整数据. 必要时打开带 anchor 参数的 szwego,
     让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
     merge 到本地 scrape_all.json 后再验证.
     """
     has_target = (lambda: _data_has_code(scrape_path, config, supplier_name, code)) if code else (
         lambda: _data_has_date(scrape_path, config, supplier_name, date_str))
     target = f"编码「{code}」" if code else date_str
-    if has_target():
+    target_exists = has_target()
+    if target_exists and not force_fetch:
         return True
-    print(f"⚠ 本地数据没有 「{supplier_name}」 {target} 的内容, 帮你去深挖...")
+    if target_exists:
+        print(f"⚠ 为避免 「{supplier_name}」 {target} 的素材不完整, 重新深挖全部分页...")
+    else:
+        print(f"⚠ 本地数据没有 「{supplier_name}」 {target} 的内容, 帮你去深挖...")
     # 打开带 anchor 参数的 szwego, 书签会读 URL 参数决定行为
     # 参数放 hash 前 (search), 否则 vue router 匹配失败白屏
     anchor_url = (
@@ -1238,6 +1266,16 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                 s1 = anchor_dl.stat().st_size; time.sleep(0.5)
                 if anchor_dl.stat().st_size != s1: continue
                 print(f"  ⇣ 收到深挖数据: {anchor_dl}")
+                expected_aid = config.get("suppliers", {}).get(supplier_name)
+                if not expected_aid:
+                    expected_aid = next((a for n, a in config.get("suppliers", {}).items()
+                                         if supplier_name in n), None)
+                if code:
+                    problem = _code_anchor_problem(anchor_dl, expected_aid, code)
+                    if problem:
+                        print(f"⚠ 本次深挖不可用: {problem}")
+                        print(f"  已保留诊断文件: {anchor_dl}")
+                        return False
                 if _merge_anchor_into_scrape(scrape_path, anchor_dl):
                     anchor_dl.unlink()  # 用完删掉
                     if has_target():
@@ -1255,6 +1293,10 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
             if all_new and all_new.stat().st_mtime > all_dl_orig_mtime and all_new.stat().st_mtime > start_ts:
                 s1 = all_new.stat().st_size; time.sleep(0.5)
                 if all_new.stat().st_size != s1: continue
+                if code:
+                    print("⚠ 编码模式不接受普通单页抓取, 请点击当前深挖页面上的新版书签")
+                    all_dl_orig_mtime = all_new.stat().st_mtime
+                    continue
                 if has_target():
                     print(f"✓ 全量数据里已找到 {target}")
                     return True
@@ -1271,9 +1313,9 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
 
 
 def ensure_data_for_code(scrape_path, config, supplier_name, code, timeout=240):
-    """确保指定供货商的抓取数据里有目标编码, 否则按供货商逐页深挖."""
+    """按供货商逐页刷新目标编码, 避免本地只有部分命中帖."""
     return ensure_data_for_date(
-        scrape_path, config, supplier_name, "", timeout=timeout, code=code)
+        scrape_path, config, supplier_name, "", timeout=timeout, code=code, force_fetch=True)
 
 
 def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
@@ -1428,19 +1470,23 @@ if(anchorSup&&(anchorDate||anchorCode)){
   let aid=null,name=anchorSup;
   for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
   if(!aid){alert('未找到供货商: '+anchorSup);return;}
-  const all=[];let pageTs='',pages=0;const MAX=15;
+  const all=[];let pageTs='',pages=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,stopReason='end';const MAX=50;
   while(pages<MAX){
-    let d;try{d=await fetchOne(aid,pageTs,anchorDate||'');}catch(e){break;}
+    let d;try{d=await fetchOne(aid,pageTs,anchorDate||'');}catch(e){incomplete=true;stopReason='network';break;}
     const items=filt(d.result&&d.result.items?d.result.items:[]);
     if(items.length===0)break;
+    const pageHasCode=anchorCode&&items.some(i=>(i.title||'').includes(anchorCode));
+    if(pageHasCode){foundCode=true;missesAfterCode=0;}else if(anchorCode&&foundCode){missesAfterCode++;}
     all.push(...items);pages++;
-    if(anchorCode&&items.some(i=>(i.title||'').includes(anchorCode)))break;
-    if(!d.result.pagination||!d.result.pagination.isLoadMore)break;
+    hasMore=!!(d.result.pagination&&d.result.pagination.isLoadMore);
+    if(anchorCode&&foundCode&&missesAfterCode>=2){stopReason='boundary';break;}
+    if(!hasMore)break;
     pageTs=d.result.pagination.pageTimestamp;
     await new Promise(r=>setTimeout(r,150));
   }
-  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,pages}},'scrape_anchor.json');
-  alert('深挖完成: '+name+' '+(anchorCode||anchorDate)+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
+  if(pages===MAX&&hasMore){incomplete=true;stopReason='limit';}
+  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,pages,incomplete,stopReason}},'scrape_anchor.json');
+  alert((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+(anchorCode||anchorDate)+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;
 }
 const out={data:{}};let ok=0,err=0;

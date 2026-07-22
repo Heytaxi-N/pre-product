@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -18,6 +19,64 @@ def make_item(goods_id, minute):
 
 
 class CodeModeTests(unittest.TestCase):
+    def test_code_anchor_reports_validation_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scrape_anchor.json"
+            base = {
+                "albumId": "album-1",
+                "items": [make_item("match", 1)],
+                "anchor": {"incomplete": False, "code": "0714c"},
+            }
+            path.write_text(json.dumps(base))
+            self.assertEqual("", pick_products._code_anchor_problem(path, "album-1", "0714c"))
+
+            path.write_text(json.dumps({**base, "anchor": {
+                "incomplete": True, "code": "0714c", "stopReason": "limit", "pages": 50,
+            }}))
+            self.assertIn("50 页上限", pick_products._code_anchor_problem(path, "album-1", "0714c"))
+
+            path.write_text(json.dumps({**base, "anchor": {}}))
+            self.assertIn("旧版书签", pick_products._code_anchor_problem(path, "album-1", "0714c"))
+
+            path.write_text(json.dumps({**base, "albumId": "other-album"}))
+            self.assertIn("相册不符", pick_products._code_anchor_problem(path, "album-1", "0714c"))
+
+            path.write_text(json.dumps({**base, "anchor": {
+                "incomplete": False, "code": "other-code",
+            }}))
+            self.assertIn("编码不符", pick_products._code_anchor_problem(path, "album-1", "0714c"))
+
+    def test_code_mode_always_refreshes_remote_pages(self):
+        with patch.object(pick_products, "ensure_data_for_date", return_value=True) as ensure:
+            result = pick_products.ensure_data_for_code(
+                "/tmp/scrape_all.json", {}, "晨星外贸06", "0722b"
+            )
+
+        self.assertTrue(result)
+        self.assertTrue(ensure.call_args.kwargs["force_fetch"])
+
+    def test_code_mode_rejects_regular_scrape_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            regular_scrape = tmp_path / "scrape_all.json"
+            regular_scrape.write_text("{}")
+            clock = iter((100, 100, 100, 102))
+
+            with patch.object(pick_products, "_data_has_code", side_effect=(False, True)) as has_code, \
+                    patch.object(pick_products, "pick_newest_download",
+                                 side_effect=lambda base: regular_scrape if base == "scrape_all" else None), \
+                    patch.object(pick_products.time, "time", side_effect=lambda: next(clock)), \
+                    patch.object(pick_products.time, "sleep"), \
+                    patch("webbrowser.open"):
+                result = pick_products.ensure_data_for_date(
+                    tmp_path / "local.json",
+                    {"suppliers": {"晨星外贸06": "album-1"}},
+                    "晨星外贸06", "", timeout=1, code="0722b", force_fetch=True,
+                )
+
+        self.assertFalse(result)
+        self.assertEqual(1, has_code.call_count)
+
     def test_preview_embeds_video_first_frame_and_hover_player(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
