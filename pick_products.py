@@ -537,6 +537,25 @@ def _item_display_date(it):
     """页面日期按发布时间计算."""
     return _item_date(it)
 
+def find_title_range(items, start_prefix, end_prefix, date_str):
+    """在指定发布日期内, 按页面编排顺序返回两个标题前缀之间的帖子."""
+    ordered = sorted(
+        [it for it in items if _item_display_date(it) == date_str],
+        key=_item_order,
+    )
+    prefixes = (("起始", start_prefix.strip()), ("结束", end_prefix.strip()))
+    matched = []
+    for label, prefix in prefixes:
+        indices = [
+            i for i, it in enumerate(ordered)
+            if (it.get("title") or "").strip().startswith(prefix)
+        ]
+        if len(indices) != 1:
+            return [], f"{label}前缀「{prefix}」匹配到 {len(indices)} 条, 请提供更多标题字"
+        matched.append(indices[0])
+    lo, hi = sorted(matched)
+    return ordered[lo:hi + 1], ""
+
 def _progress_date(progress, album_id):
     """取上次处理到的日期串. 兼容旧格式(int 毫秒时间戳)."""
     v = progress.get(album_id)
@@ -1156,12 +1175,21 @@ def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
             raw = {"data": {}}
     else:
         raw = {"data": {}}
-    # 已有该 aid 的 items 按 goods_id 用本次抓取完整替换, 避免残留旧字段.
     existing = raw["data"].get(aid, {"supplier": anchor.get("supplier", ""), "items": []})
-    incoming = {it["goods_id"]: it for it in items}
-    existing_ids = {it["goods_id"] for it in existing["items"]}
-    merged_items = [incoming.get(it["goods_id"], it) for it in existing["items"]]
-    merged_items.extend(it for gid, it in incoming.items() if gid not in existing_ids)
+    meta = anchor.get("anchor") or {}
+    if meta.get("fullScan") is True:
+        merged_items = list(items)
+    elif meta.get("dateScan") is True:
+        scan_date = meta.get("rangeDate")
+        merged_items = [
+            it for it in existing["items"]
+            if _item_display_date(it) != scan_date
+        ] + list(items)
+    else:
+        incoming = {it["goods_id"]: it for it in items}
+        existing_ids = {it["goods_id"] for it in existing["items"]}
+        merged_items = [incoming.get(it["goods_id"], it) for it in existing["items"]]
+        merged_items.extend(it for gid, it in incoming.items() if gid not in existing_ids)
     existing = {
         **existing,
         "supplier": anchor.get("supplier") or existing.get("supplier", ""),
@@ -1218,6 +1246,36 @@ def _date_anchor_problem(anchor_json_path, expected_aid, date_str):
                 f"停止原因 {meta.get('stopReason', 'unknown')}")
     return ""
 
+def _range_anchor_problem(anchor_json_path, expected_aid, date_str, start_prefix, end_prefix):
+    """返回本次标题范围深挖的具体问题; 空串表示可用."""
+    try:
+        anchor = json.loads(Path(anchor_json_path).read_text())
+    except Exception:
+        return "下载文件无法读取"
+    if anchor.get("albumId") != expected_aid:
+        return "下载文件与目标相册不符"
+    meta = anchor.get("anchor") or {}
+    if (
+        meta.get("rangeDate") != date_str
+        or meta.get("rangeStart") != start_prefix
+        or meta.get("rangeEnd") != end_prefix
+    ):
+        return "下载文件与本次日期或首尾前缀不符"
+    if meta.get("dateScan") is not True:
+        return "仍在使用旧版书签, 请从 install_bookmark.html 重新替换"
+    if meta.get("incomplete"):
+        return (f"深挖未完成: {meta.get('pages', 0)} 页, "
+                f"停止原因 {meta.get('stopReason', 'unknown')}")
+    items = anchor.get("items", [])
+    if not items:
+        return (f"未抓到 {date_str}: 原始 {meta.get('rawCount', '?')} 条, "
+                f"{meta.get('pages', 0)} 页, "
+                f"停止原因 {meta.get('stopReason', 'unknown')}")
+    if any(it.get("update_time") is None for it in items):
+        return "深挖数据缺少 update_time, 无法还原真实排序"
+    _, problem = find_title_range(items, start_prefix, end_prefix, date_str)
+    return problem
+
 
 def pick_newest_download(base):
     """Downloads 里 base*.json 取 mtime 最新的一个, 删掉其余旧副本,
@@ -1243,18 +1301,24 @@ def pick_newest_download(base):
 
 
 def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code="",
-                         force_fetch=True):
-    """前置: 确保 scrape 里有指定日期或编码的完整数据. 必要时打开带 anchor 参数的 szwego,
+                         force_fetch=True, range_start="", range_end=""):
+    """前置: 确保 scrape 里有指定日期、编码或标题范围的完整数据. 必要时打开带 anchor 参数的 szwego,
     让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
     merge 到本地 scrape_all.json 后再验证.
     """
+    range_mode = bool(range_start and range_end)
     has_target = (lambda: _data_has_code(scrape_path, config, supplier_name, code)) if code else (
         lambda: _data_has_date(scrape_path, config, supplier_name, date_str))
-    target = f"编码「{code}」" if code else date_str
-    target_exists = has_target()
+    target = (
+        f"{date_str} 标题范围「{range_start}」到「{range_end}」" if range_mode
+        else (f"编码「{code}」" if code else date_str)
+    )
+    target_exists = False if range_mode else has_target()
     if target_exists and not force_fetch:
         return True
-    if target_exists:
+    if range_mode:
+        print(f"⚠ 为确保 「{supplier_name}」 {target} 完整, 重新深挖全部分页...")
+    elif target_exists:
         print(f"⚠ 为避免 「{supplier_name}」 {target} 的素材不完整, 重新深挖全部分页...")
     else:
         print(f"⚠ 本地数据没有 「{supplier_name}」 {target} 的内容, 帮你去深挖...")
@@ -1263,7 +1327,15 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
     anchor_url = (
         "https://www.szwego.com/static/index.html"
         + f"?anchor_supplier={urllib.parse.quote(supplier_name)}"
-        + (f"&anchor_code={urllib.parse.quote(code)}" if code else f"&anchor_date={date_str}")
+        + (
+            f"&anchor_code={urllib.parse.quote(code)}" if code
+            else (
+                f"&range_start={urllib.parse.quote(range_start)}"
+                f"&range_end={urllib.parse.quote(range_end)}"
+                f"&range_date={date_str}"
+                if range_mode else f"&anchor_date={date_str}"
+            )
+        )
         + "#/album_home"
     )
     try:
@@ -1299,7 +1371,15 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                 if not expected_aid:
                     expected_aid = next((a for n, a in config.get("suppliers", {}).items()
                                          if supplier_name in n), None)
-                if code:
+                if range_mode:
+                    problem = _range_anchor_problem(
+                        anchor_dl, expected_aid, date_str, range_start, range_end
+                    )
+                    if problem:
+                        print(f"⚠ 本次深挖不可用: {problem}")
+                        print(f"  已保留诊断文件: {anchor_dl}")
+                        return False
+                elif code:
                     problem = _code_anchor_problem(anchor_dl, expected_aid, code)
                     if problem:
                         print(f"⚠ 本次深挖不可用: {problem}")
@@ -1313,6 +1393,9 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                         return False
                 if _merge_anchor_into_scrape(scrape_path, anchor_dl):
                     anchor_dl.unlink()  # 用完删掉
+                    if range_mode:
+                        print(f"✓ merge 后已找到 {target}")
+                        return True
                     if has_target():
                         print(f"✓ merge 后已找到 {target}")
                         return True
@@ -1328,8 +1411,9 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
             if all_new and all_new.stat().st_mtime > all_dl_orig_mtime and all_new.stat().st_mtime > start_ts:
                 s1 = all_new.stat().st_size; time.sleep(0.5)
                 if all_new.stat().st_size != s1: continue
-                if code:
-                    print("⚠ 编码模式不接受普通单页抓取, 请点击当前深挖页面上的新版书签")
+                if code or range_mode:
+                    label = "编码模式" if code else "标题范围模式"
+                    print(f"⚠ {label}不接受普通单页抓取, 请点击当前深挖页面上的新版书签")
                     all_dl_orig_mtime = all_new.stat().st_mtime
                     continue
                 if has_target():
@@ -1351,6 +1435,13 @@ def ensure_data_for_code(scrape_path, config, supplier_name, code, timeout=240):
     """按供货商逐页刷新目标编码, 避免本地只有部分命中帖."""
     return ensure_data_for_date(
         scrape_path, config, supplier_name, "", timeout=timeout, code=code, force_fetch=True)
+
+def ensure_data_for_range(
+        scrape_path, config, supplier_name, date_str, start_prefix, end_prefix, timeout=240):
+    """刷新指定日期, 保证标题首尾之间的帖子完整."""
+    return ensure_data_for_date(
+        scrape_path, config, supplier_name, date_str, timeout=timeout,
+        range_start=start_prefix, range_end=end_prefix, force_fetch=True)
 
 
 def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
@@ -1434,6 +1525,42 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
                        advance_progress=False)
     print(f"\n{'='*50}\n✓ 锚点定向完成, 处理 {n} 个产品 (未推进进度)")
 
+def cmd_title_range(
+        config, progress, data, supplier_name, date_str, start_prefix, end_prefix):
+    """按标题首尾前缀选择连续帖子, 作为一个产品处理."""
+    suppliers = config.get("suppliers", {})
+    aid = suppliers.get(supplier_name)
+    if not aid:
+        for name, album_id in suppliers.items():
+            if supplier_name in name:
+                supplier_name, aid = name, album_id
+                break
+    if not aid:
+        print(f"❌ 供货商 「{supplier_name}」 未在 config.json 里配置"); return
+    if aid not in data or not data[aid].get("items"):
+        print(f"❌ 抓取数据里没有 「{supplier_name}」 的内容"); return
+
+    date_str = _normalize_date(date_str)
+    group, problem = find_title_range(
+        data[aid]["items"], start_prefix, end_prefix, date_str)
+    if problem:
+        print(f"❌ {problem}"); return
+
+    print(
+        f"首尾定向: 供货商={supplier_name} "
+        f"日期={date_str} 起始=「{start_prefix}」 结束=「{end_prefix}」"
+    )
+    print(f"  选中 {len(group)} 帖 (包含首尾)")
+    fs_cfg = config.get("feishu") or {}
+    feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
+    ai_cfg = config.get("ai_vision") or {}
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    n = process_groups(
+        supplier_name, aid, [group], progress, feishu, fs_cfg, ai_cfg,
+        advance_progress=False,
+    )
+    print(f"\n{'='*50}\n✓ 首尾定向完成, 处理 {n} 个产品 (未推进进度)")
+
 
 def cmd_process_confirmed(config, progress, confirmed_path):
     """按确认后的分组处理."""
@@ -1486,7 +1613,7 @@ def cmd_install_bookmark(config):
 const SUP=__SUPPLIERS__;
 const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,update_time:it.update_time,videoUrl:it.videoUrl||it.videoURL||''});
 const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id).map(clean);
-const anchorClean=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime).map(clean);
+const anchorClean=arr=>arr.filter(i=>!i.isTop).map(clean);
 const itemDate=it=>{const d=new Date(it.time_stamp),p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
 const fetchOne=async(aid,pageTs)=>{
   const u='https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate=&endDate=&sourceId=&requestDataType='+(pageTs?'&slipType=1&timestamp='+pageTs:'');
@@ -1501,31 +1628,39 @@ const params=new URLSearchParams(location.search);
 const anchorSup=params.get('anchor_supplier');
 const anchorDate=params.get('anchor_date');
 const anchorCode=params.get('anchor_code');
-if(anchorSup&&(anchorDate||anchorCode)){
+const rangeStart=params.get('range_start');
+const rangeEnd=params.get('range_end');
+const rangeDate=params.get('range_date');
+if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
   let aid=null,name=anchorSup;
   for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
   if(!aid){alert('未找到供货商: '+anchorSup);return;}
-  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,stopReason='end';const MAX=50;
-  while(pages<MAX){
+  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,foundRangeDate=false,missesAfterRangeDate=0,stopReason='end';const MAX=50;const RANGE_MAX=10;const pageLimit=rangeDate?RANGE_MAX:MAX;
+  while(pages<pageLimit){
     let d;try{d=await fetchOne(aid,pageTs);}catch(e){incomplete=true;stopReason='network';break;}
     const rawItems=d.result&&d.result.items?d.result.items:[];
     rawCount+=rawItems.length;
-    const items=anchorDate?anchorClean(rawItems):filt(rawItems);
-    if(items.length===0)break;
+    const items=(anchorDate||rangeStart)?anchorClean(rawItems):filt(rawItems);
+    if(rawItems.length===0)break;
+    const rangeItems=rangeDate?items.filter(i=>itemDate(i)===rangeDate):items;
     const pageHasCode=anchorCode&&items.some(i=>(i.title||'').includes(anchorCode));
     const pageHasDate=anchorDate&&items.some(i=>itemDate(i)===anchorDate);
+    const pageHasRangeDate=rangeDate&&items.some(i=>itemDate(i)===rangeDate);
     if(pageHasCode){foundCode=true;missesAfterCode=0;}else if(anchorCode&&foundCode){missesAfterCode++;}
     if(pageHasDate)foundDate=true;
-    all.push(...items);pages++;
+    if(pageHasRangeDate){foundRangeDate=true;missesAfterRangeDate=0;}else if(rangeDate&&foundRangeDate){missesAfterRangeDate++;}
+    all.push(...rangeItems);pages++;
     hasMore=!!(d.result.pagination&&d.result.pagination.isLoadMore);
     if(anchorCode&&foundCode&&missesAfterCode>=2){stopReason='boundary';break;}
+    if(rangeDate&&foundRangeDate&&missesAfterRangeDate>=2){stopReason='date-boundary';break;}
     if(!hasMore)break;
     pageTs=d.result.pagination.pageTimestamp;
     await new Promise(r=>setTimeout(r,150));
   }
-  if(pages===MAX&&hasMore){incomplete=true;stopReason='limit';}
-  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,pages,rawCount,foundDate,incomplete,stopReason,fullScan:!!anchorDate}},'scrape_anchor.json');
-  alert((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+(anchorCode||anchorDate)+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
+  if(pages===pageLimit&&hasMore&&stopReason==='end'){incomplete=true;stopReason='limit';}
+  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,rangeDate,rangeStart,rangeEnd,pages,rawCount,foundDate,incomplete,stopReason,fullScan:!!anchorDate,dateScan:!!rangeDate}},'scrape_anchor.json');
+  const target=anchorCode||anchorDate||(rangeDate+' '+rangeStart+' → '+rangeEnd);
+  alert((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+target+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;
 }
 const out={data:{}};let ok=0,err=0;
@@ -1607,11 +1742,12 @@ def main():
     # 位置参数: [mode] [供货商] [编码]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
     mode = ""
-    if positional and positional[0] in ("preview", "process", "run", "bookmark", "anchor"):
+    if positional and positional[0] in ("preview", "process", "run", "bookmark", "anchor", "range"):
         mode = positional.pop(0)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
     code_arg = positional[1] if len(positional) >= 2 else ""
     date_arg = positional[2] if len(positional) >= 3 else ""  # anchor 专用
+    end_arg = positional[3] if len(positional) >= 4 else ""  # range 专用
 
     supplier = supplier_arg or os.environ.get("SUPPLIERS", "")
     code = code_arg or os.environ.get("CODE", "")
@@ -1637,6 +1773,21 @@ def main():
 
     default_scrape = Path.home() / "Downloads" / "scrape_all.json"
     env_scrape = os.environ.get("SCRAPE_JSON")
+    if mode == "range":
+        if len(positional) != 4 or not (supplier_arg and code_arg and date_arg and end_arg):
+            print("用法: python3 pick_products.py range <供货商> <日期MM-DD> <起始帖标题前缀> <结束帖标题前缀>"); sys.exit(1)
+        scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
+        norm_date = _normalize_date(code_arg)
+        if not ensure_data_for_range(
+            scrape_path, config, supplier_arg, norm_date, date_arg, end_arg
+        ):
+            print("❌ 未获取到完整的首尾标题范围, 无法继续"); return
+        data = load_scrape(scrape_path, config)
+        cmd_title_range(
+            config, progress, data, supplier_arg, norm_date, date_arg, end_arg
+        )
+        return
+
     # anchor 模式即使本地没数据也继续 (ensure_data_for_date 会深挖创建)
     if mode == "anchor":
         if not (supplier_arg and code_arg and date_arg):

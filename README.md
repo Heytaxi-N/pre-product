@@ -91,6 +91,16 @@ python3 pick_products.py anchor 南在南方 凯乐石女款裙裤 04-30
 
 分段不调 AI(纯看图数+文案),只有图片分类排序才用 AI。不推进进度。
 
+### 首尾标题定向(没有占位图时)
+
+提供首帖和尾帖标题开头的几个字,下载首尾两帖以及两者之间的全部帖子:
+
+```bash
+python3 pick_products.py range 晓豪 07-17 "26版 T10四季裤" "T10 四季软壳裤"
+```
+
+书签最多翻 10 页,只保留指定发布日期的数据;找到该日期后连续两页没有当天帖子就停止,再按当天页面真实 `update_time` 顺序定位首尾。标题前缀必须各自只匹配一帖;匹配不到或匹配多帖时会停止,请把前缀写得更长。首尾输入顺序按你在页面上看到的顺序即可,程序会自动取两者之间的连续区间。该模式不依赖占位图,整段作为一个产品进入排序预览,并且不推进日常进度。
+
 **常见问题**
 
 - `❌ AI 视觉调用失败, 无法进行占位图判定`:说明 `ai_vision.api_key` 无效或额度耗尽。锚点定向依赖占位图判定,AI 不可用会直接终止(避免误处理海量数据)。请检查 [token.xiaorongtech.com](https://token.xiaorongtech.com) 的额度或换 key。
@@ -100,6 +110,7 @@ python3 pick_products.py anchor 南在南方 凯乐石女款裙裤 04-30
 - `python3 pick_products.py bookmark` — 生成/更新书签安装页 + 兜底 console 脚本
 - `python3 pick_products.py run [供货商] [编码]` — 直接跑;带编码时弹分类预览,不带编码时不弹
 - `python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD>` — 锚点定向
+- `python3 pick_products.py range <供货商> <日期MM-DD> <起始标题前缀> <结束标题前缀>` — 首尾标题定向
 - `python3 pick_products.py process <confirmed.json>` — 只处理已确认的分组文件
 
 环境变量:`SUPPLIERS=`、`CODE=`、`MAX_PRODUCTS=`、`SCRAPE_JSON=`。

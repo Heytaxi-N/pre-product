@@ -131,6 +131,29 @@ class AnchorTests(unittest.TestCase):
             self.assertEqual(2, merged["data"]["album-1"]["items"][0]["time_stamp"])
             self.assertNotIn("update_time", merged["data"]["album-1"]["items"][0])
 
+    def test_full_scan_replaces_stale_supplier_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scrape_path = Path(tmp) / "scrape_all.json"
+            anchor_path = Path(tmp) / "scrape_anchor.json"
+            scrape_path.write_text(json.dumps({"data": {"album-1": {
+                "supplier": "南在南方",
+                "items": [{"goods_id": "stale", "time_stamp": 1}],
+            }}}))
+            anchor_path.write_text(json.dumps({
+                "supplier": "南在南方",
+                "albumId": "album-1",
+                "items": [{"goods_id": "fresh", "time_stamp": 2}],
+                "anchor": {"fullScan": True},
+            }))
+
+            self.assertTrue(pick_products._merge_anchor_into_scrape(scrape_path, anchor_path))
+            merged = json.loads(scrape_path.read_text())
+
+        self.assertEqual(
+            ["fresh"],
+            [item["goods_id"] for item in merged["data"]["album-1"]["items"]],
+        )
+
     def test_date_anchor_reports_empty_capture_details(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scrape_anchor.json"
