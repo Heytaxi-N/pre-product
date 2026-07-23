@@ -533,6 +533,10 @@ def _item_order(it):
     """页面编排顺序使用 update_time; 旧抓取数据回退到发布时间."""
     return it.get("update_time") or it["time_stamp"]
 
+def _item_display_date(it):
+    """页面日期按发布时间计算."""
+    return _item_date(it)
+
 def _progress_date(progress, album_id):
     """取上次处理到的日期串. 兼容旧格式(int 毫秒时间戳)."""
     v = progress.get(album_id)
@@ -1102,7 +1106,7 @@ def _normalize_date(date_str):
     return date_str.strip()  # 无法识别, 原样返回
 
 def _data_has_date(scrape_path, config, supplier_name, date_str, require_order=True):
-    """检查 scrape 里是否有目标日期内容, 默认同时要求页面排序字段."""
+    """检查 scrape 里是否有目标发布日期, 默认同时要求页面排序字段."""
     p = Path(scrape_path)
     if not p.exists():
         return False
@@ -1118,7 +1122,7 @@ def _data_has_date(scrape_path, config, supplier_name, date_str, require_order=T
                 aid = a; break
     if not aid or aid not in d:
         return False
-    matches = [it for it in d[aid].get("items", []) if _item_date(it) == date_str]
+    matches = [it for it in d[aid].get("items", []) if _item_display_date(it) == date_str]
     return bool(matches) and (not require_order or all(it.get("update_time") for it in matches))
 
 
@@ -1152,16 +1156,17 @@ def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
             raw = {"data": {}}
     else:
         raw = {"data": {}}
-    # 已有该 aid 的 items 按 goods_id 刷新, 补齐 update_time 等深挖字段.
+    # 已有该 aid 的 items 按 goods_id 用本次抓取完整替换, 避免残留旧字段.
     existing = raw["data"].get(aid, {"supplier": anchor.get("supplier", ""), "items": []})
-    by_id = {it["goods_id"]: it for it in existing["items"]}
-    for it in items:
-        old = by_id.get(it["goods_id"])
-        if old is not None:
-            old.update(it)
-        else:
-            existing["items"].append(it); by_id[it["goods_id"]] = it
-    existing["supplier"] = anchor.get("supplier") or existing.get("supplier", "")
+    incoming = {it["goods_id"]: it for it in items}
+    existing_ids = {it["goods_id"] for it in existing["items"]}
+    merged_items = [incoming.get(it["goods_id"], it) for it in existing["items"]]
+    merged_items.extend(it for gid, it in incoming.items() if gid not in existing_ids)
+    existing = {
+        **existing,
+        "supplier": anchor.get("supplier") or existing.get("supplier", ""),
+        "items": merged_items,
+    }
     raw["data"][aid] = existing
     Path(scrape_path).write_text(json.dumps(raw, ensure_ascii=False, indent=2))
     return True
@@ -1190,6 +1195,30 @@ def _code_anchor_problem(anchor_json_path, expected_aid, code):
     return ""
 
 
+def _date_anchor_problem(anchor_json_path, expected_aid, date_str):
+    """返回本次日期深挖的具体问题; 空串表示可用."""
+    try:
+        anchor = json.loads(Path(anchor_json_path).read_text())
+    except Exception:
+        return "下载文件无法读取"
+    if anchor.get("albumId") != expected_aid:
+        return "下载文件与目标相册不符"
+    meta = anchor.get("anchor") or {}
+    if meta.get("date") != date_str:
+        return "下载文件与本次请求日期不符"
+    if meta.get("fullScan") is not True:
+        return "仍在使用旧版书签, 请从 install_bookmark.html 重新替换"
+    if meta.get("incomplete"):
+        return (f"深挖未完成: {meta.get('pages', 0)} 页, "
+                f"停止原因 {meta.get('stopReason', 'unknown')}")
+    items = anchor.get("items", [])
+    if not any(_item_display_date(it) == date_str for it in items):
+        return (f"未抓到 {date_str}: 原始 {meta.get('rawCount', '?')} 条, "
+                f"清洗后 {len(items)} 条, {meta.get('pages', 0)} 页, "
+                f"停止原因 {meta.get('stopReason', 'unknown')}")
+    return ""
+
+
 def pick_newest_download(base):
     """Downloads 里 base*.json 取 mtime 最新的一个, 删掉其余旧副本,
     把最新的规范化成 base.json 返回其路径; 没有则 None。
@@ -1214,7 +1243,7 @@ def pick_newest_download(base):
 
 
 def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code="",
-                         force_fetch=False):
+                         force_fetch=True):
     """前置: 确保 scrape 里有指定日期或编码的完整数据. 必要时打开带 anchor 参数的 szwego,
     让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
     merge 到本地 scrape_all.json 后再验证.
@@ -1272,6 +1301,12 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                                          if supplier_name in n), None)
                 if code:
                     problem = _code_anchor_problem(anchor_dl, expected_aid, code)
+                    if problem:
+                        print(f"⚠ 本次深挖不可用: {problem}")
+                        print(f"  已保留诊断文件: {anchor_dl}")
+                        return False
+                else:
+                    problem = _date_anchor_problem(anchor_dl, expected_aid, date_str)
                     if problem:
                         print(f"⚠ 本次深挖不可用: {problem}")
                         print(f"  已保留诊断文件: {anchor_dl}")
@@ -1340,16 +1375,15 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
     date_str = _normalize_date(date_str)
     print(f"锚点定位: 供货商={supplier_name} 日期={date_str} 关键词=「{keyword}」")
 
-    # 3. 该日期条目, 按页面编排时间升序
-    day_items = sorted(
-        [it for it in data[aid]["items"] if _item_date(it) == date_str],
-        key=_item_order)
-    if not day_items:
+    # 3. 日期只定位锚点; 占位图边界必须在供应商完整页面顺序中查找.
+    ordered_items = sorted(data[aid]["items"], key=_item_order)
+    date_items = [it for it in ordered_items if _item_display_date(it) == date_str]
+    if not date_items:
         print(f"❌ 该日期无内容"); return
-    print(f"  当日 {len(day_items)} 帖")
+    print(f"  当日 {len(date_items)} 帖")
 
     # 4. 找匹配锚点
-    matched_ids = {it["goods_id"] for it in day_items if keyword in (it.get("title") or "")}
+    matched_ids = {it["goods_id"] for it in date_items if keyword in (it.get("title") or "")}
     if not matched_ids:
         print(f"❌ 没有 title 含「{keyword}」的条目"); return
     print(f"  匹配锚点 {len(matched_ids)} 条")
@@ -1357,14 +1391,14 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
     # 5. 占位图 = 只有 1 张图 且 无任何文案.
     #    锚点前后最近的占位图就是该产品边界.
     ai_cfg = config.get("ai_vision") or {}
-    matched_indices = [i for i, it in enumerate(day_items) if it["goods_id"] in matched_ids]
+    matched_indices = [i for i, it in enumerate(ordered_items) if it["goods_id"] in matched_ids]
 
     def _is_struct_placeholder(item):
         imgs = item.get("imgsSrc") or []
         return len(imgs) == 1 and not (item.get("title") or "").strip()
 
-    placeholder_indices = [i for i, it in enumerate(day_items) if _is_struct_placeholder(it)]
-    print(f"  当日识别占位图 {len(placeholder_indices)} 张")
+    placeholder_indices = [i for i, it in enumerate(ordered_items) if _is_struct_placeholder(it)]
+    print(f"  完整排序识别占位图 {len(placeholder_indices)} 张")
 
     # 6. 找锚点前后最近的占位图; 同一边界的多个锚点只处理一次.
     groups_by_bounds = {}
@@ -1380,7 +1414,7 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
     all_groups = []
     for (opening, closing), anchor_indices in groups_by_bounds.items():
         selected = list(range(opening + 1, closing))
-        all_groups.append([day_items[i] for i in selected])
+        all_groups.append([ordered_items[i] for i in selected])
         print(f"    边界 #{opening}..#{closing}: 锚点 {len(anchor_indices)} 帖, 素材 {len(selected)} 帖")
 
     if not all_groups:
@@ -1450,12 +1484,13 @@ def cmd_install_bookmark(config):
     # 书签的 javascript: URL — 编码为 URI 保证在 href 里合法
     bookmarklet_body = r"""(async()=>{
 const SUP=__SUPPLIERS__;
-const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,update_time:it.update_time||it.time_stamp,videoUrl:it.videoUrl||it.videoURL||''});
+const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,update_time:it.update_time,videoUrl:it.videoUrl||it.videoURL||''});
 const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id).map(clean);
-const fetchOne=async(aid,pageTs,dateFilter)=>{
-  const ds=dateFilter||'';const de=dateFilter||'';
-  const u='https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate='+ds+'&endDate='+de+'&sourceId=&requestDataType='+(pageTs?'&slipType=1&timestamp='+pageTs:'');
-  const r=await fetch(u,{method:'POST'});return await r.json();
+const anchorClean=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime).map(clean);
+const itemDate=it=>{const d=new Date(it.time_stamp),p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
+const fetchOne=async(aid,pageTs)=>{
+  const u='https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate=&endDate=&sourceId=&requestDataType='+(pageTs?'&slipType=1&timestamp='+pageTs:'');
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:''});return await r.json();
 };
 const dl=(data,fname)=>{
   const blob=new Blob([JSON.stringify(data)],{type:'application/json'});
@@ -1470,13 +1505,17 @@ if(anchorSup&&(anchorDate||anchorCode)){
   let aid=null,name=anchorSup;
   for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
   if(!aid){alert('未找到供货商: '+anchorSup);return;}
-  const all=[];let pageTs='',pages=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,stopReason='end';const MAX=50;
+  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,stopReason='end';const MAX=50;
   while(pages<MAX){
-    let d;try{d=await fetchOne(aid,pageTs,anchorDate||'');}catch(e){incomplete=true;stopReason='network';break;}
-    const items=filt(d.result&&d.result.items?d.result.items:[]);
+    let d;try{d=await fetchOne(aid,pageTs);}catch(e){incomplete=true;stopReason='network';break;}
+    const rawItems=d.result&&d.result.items?d.result.items:[];
+    rawCount+=rawItems.length;
+    const items=anchorDate?anchorClean(rawItems):filt(rawItems);
     if(items.length===0)break;
     const pageHasCode=anchorCode&&items.some(i=>(i.title||'').includes(anchorCode));
+    const pageHasDate=anchorDate&&items.some(i=>itemDate(i)===anchorDate);
     if(pageHasCode){foundCode=true;missesAfterCode=0;}else if(anchorCode&&foundCode){missesAfterCode++;}
+    if(pageHasDate)foundDate=true;
     all.push(...items);pages++;
     hasMore=!!(d.result.pagination&&d.result.pagination.isLoadMore);
     if(anchorCode&&foundCode&&missesAfterCode>=2){stopReason='boundary';break;}
@@ -1485,13 +1524,13 @@ if(anchorSup&&(anchorDate||anchorCode)){
     await new Promise(r=>setTimeout(r,150));
   }
   if(pages===MAX&&hasMore){incomplete=true;stopReason='limit';}
-  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,pages,incomplete,stopReason}},'scrape_anchor.json');
+  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,pages,rawCount,foundDate,incomplete,stopReason,fullScan:!!anchorDate}},'scrape_anchor.json');
   alert((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+(anchorCode||anchorDate)+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;
 }
 const out={data:{}};let ok=0,err=0;
 for(const [name,aid] of Object.entries(SUP)){
-  try{const d=await fetchOne(aid,'','');out.data[aid]={supplier:name,items:filt(d.result&&d.result.items?d.result.items:[])};ok++;}
+  try{const d=await fetchOne(aid,'');out.data[aid]={supplier:name,items:filt(d.result&&d.result.items?d.result.items:[])};ok++;}
   catch(e){out.data[aid]={supplier:name,items:[]};err++;}
   await new Promise(r=>setTimeout(r,200));
 }
