@@ -13,6 +13,7 @@ import urllib.request, urllib.parse, urllib.error
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / (sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].endswith(".json") else "config.json")
 PROGRESS_FILE = SCRIPT_DIR / "progress.json"
+FEISHU_PENDING_FILE = SCRIPT_DIR / "feishu_pending.json"
 OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
 TMP_ROOT = Path(tempfile.gettempdir()) / "weidian_pick"  # 临时/缓存, 不落在商品图里
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 config.json 里配 defaults.max_products
@@ -71,18 +72,15 @@ def _ensure_first_image(item, cache_dir):
     return dest
 
 def _ai_same_product(ai_cfg, a, b, cache_dir):
-    """AI 判断两帖是否同一件商品. 失败时保守返回 False (拆开)."""
+    """AI 判断两帖是否同一件商品. None 表示调用不可用, 交给上层显式兜底."""
     base_url = (ai_cfg or {}).get("base_url", "").rstrip("/")
     api_key = (ai_cfg or {}).get("api_key", "")
     model = (ai_cfg or {}).get("model", "qwen3-vl-flash")
     if not (base_url and api_key):
-        return False
+        return None
     ia, ib = _ensure_first_image(a, cache_dir), _ensure_first_image(b, cache_dir)
     if not ia or not ib:
-        return False
-    def durl(p):
-        mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
-        return f"data:{mime};base64,{base64.b64encode(p.read_bytes()).decode()}"
+        return None
     ta = (a.get("title") or "").replace("\n", " ")[:120]
     tb = (b.get("title") or "").replace("\n", " ")[:120]
     prompt = (
@@ -97,18 +95,21 @@ def _ai_same_product(ai_cfg, a, b, cache_dir):
         f"帖子A文案: {ta}\n帖子B文案: {tb}\n"
         "只回复一个字: 是 或 否"
     )
-    payload = {"model": model, "max_tokens": 10, "messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": durl(ia)}},
-        {"type": "image_url", "image_url": {"url": durl(ib)}},
-        {"type": "text", "text": prompt},
-    ]}]}
     try:
+        def durl(p):
+            mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+            return f"data:{mime};base64,{base64.b64encode(p.read_bytes()).decode()}"
+        payload = {"model": model, "max_tokens": 10, "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": durl(ia)}},
+            {"type": "image_url", "image_url": {"url": durl(ib)}},
+            {"type": "text", "text": prompt},
+        ]}]}
         resp = http_post_json(f"{base_url}/chat/completions", payload,
                               headers={"Authorization": f"Bearer {api_key}"})
         ans = resp["choices"][0]["message"]["content"].strip()
         return ans.startswith("是") or "是" in ans[:3]
     except Exception:
-        return False
+        return None
 
 def _is_placeholder(ai_cfg, item, cache_dir):
     """判断某帖是否'与服装无关的占位/分割图'.
@@ -128,8 +129,11 @@ def _is_placeholder(ai_cfg, item, cache_dir):
     ip = _ensure_first_image(item, cache_dir)
     if not ip:
         return None
-    mime = "image/png" if ip.suffix.lower() == ".png" else "image/jpeg"
-    durl = f"data:{mime};base64,{base64.b64encode(ip.read_bytes()).decode()}"
+    try:
+        mime = "image/png" if ip.suffix.lower() == ".png" else "image/jpeg"
+        durl = f"data:{mime};base64,{base64.b64encode(ip.read_bytes()).decode()}"
+    except OSError:
+        return None
     prompt = (
         "这是微商相册里的一张图。判断它是【服装商品图】还是【占位/分割图】。\n"
         "占位/分割图: 与具体服装商品无关, 用来隔开不同产品的图, 例如纯文字提示图、"
@@ -171,7 +175,11 @@ def group_products_ai(ai_cfg, items, cache_dir):
     # ponytail: 每帖一次占位判定, 若调用量成问题再合并进分组调用
     segments = [[]]
     for it in items:
-        if _is_placeholder(ai_cfg, it, cache_dir):
+        placeholder = _is_placeholder(ai_cfg, it, cache_dir)
+        if placeholder is None:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            raise RuntimeError("AI 占位图判断失败")
+        if placeholder:
             if segments[-1]:
                 segments.append([])   # 遇占位图 → 起新段
         else:
@@ -188,7 +196,14 @@ def group_products_ai(ai_cfg, items, cache_dir):
         for cur in seg[1:]:
             prev = cur_groups[-1][-1]
             gap = (_item_order(cur) - _item_order(prev)) / 1000
-            if gap <= GROUP_MAX_GAP and _ai_same_product(ai_cfg, prev, cur, cache_dir):
+            same_product = (
+                _ai_same_product(ai_cfg, prev, cur, cache_dir)
+                if gap <= GROUP_MAX_GAP else False
+            )
+            if same_product is None:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                raise RuntimeError("AI 商品分组失败")
+            if same_product:
                 cur_groups[-1].append(cur)
             else:
                 cur_groups.append([cur])
@@ -483,6 +498,20 @@ def load_json_or(path, default):
 
 def save_json(path, data):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _feishu_pending_key(album_id, goods_ids):
+    raw = album_id + ":" + ",".join(sorted(goods_ids))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _load_feishu_pending():
+    try:
+        data = load_json_or(FEISHU_PENDING_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"  ⚠ feishu_pending.json 无法读取, 本次重新建记录: {e}")
+        return {}
 
 
 # ── 主流程 ────────────────────────────────────────────
@@ -797,7 +826,7 @@ def wait_for_classify_review(supplier_name, prepared, timeout=600):
     out = SCRIPT_DIR / "分类预览.html"
     build_classify_preview_html(supplier_name, prepared, out)
     # 清残留, 避免 Chrome 把新文件改名成 分类确认 (1).json
-    for p in (Path.home() / "Downloads").glob("分类确认*.json"):
+    for p in _chrome_download_paths("分类确认"):
         try: p.unlink()
         except Exception: pass
     _open_in_browser(out)
@@ -909,6 +938,7 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
 
     # Phase B: 飞书 → 建文件夹
     n = 0
+    feishu_pending = _load_feishu_pending() if feishu else {}
     for pr in prepared:
         final = pr["final"]
         if not final:
@@ -920,10 +950,32 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         for i, (p, cat, *_rest) in enumerate(final, 1):
             print(f"    {i:2d}. [{cat}{' 封面' if i == 1 and cat == '合图' else ''}] {p.name}")
         folder_name = f"{supplier_name}_{pr['latest_time'].replace(' ', '_').replace(':', '')}_{pr['gi']}"
+        pending_key = None
         if feishu:
+            pending_key = _feishu_pending_key(album_id, pr["goods_ids"])
             try:
-                record_id = feishu.create_record({fs_cfg.get("info_field", "信息"): pr["combined_text"]})
-                print(f"  ✓ 飞书记录已创建: {record_id}")
+                pending_entry = feishu_pending.get(pending_key)
+                if isinstance(pending_entry, dict):
+                    raise RuntimeError(
+                        "上次飞书记录创建结果未能落盘, 请先检查 feishu_pending.json"
+                    )
+                record_id = pending_entry
+                if record_id:
+                    print(f"  ↻ 复用待完成飞书记录: {record_id}")
+                else:
+                    feishu_pending[pending_key] = {"status": "creating"}
+                    save_json(FEISHU_PENDING_FILE, feishu_pending)
+                    try:
+                        record_id = feishu.create_record({
+                            fs_cfg.get("info_field", "信息"): pr["combined_text"]
+                        })
+                    except Exception:
+                        feishu_pending.pop(pending_key, None)
+                        save_json(FEISHU_PENDING_FILE, feishu_pending)
+                        raise
+                    feishu_pending[pending_key] = record_id
+                    save_json(FEISHU_PENDING_FILE, feishu_pending)
+                    print(f"  ✓ 飞书记录已创建: {record_id}")
                 folder_name = feishu.wait_for_field(record_id, fs_cfg.get("img_name_field", "图片名"))
                 print(f"  ✓ 图片名: {folder_name}")
             except Exception as e:
@@ -943,6 +995,12 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         n += 1
         if advance_progress:
             _record_processed_ids(progress, album_id, groups, pr["goods_ids"])
+        if pending_key:
+            feishu_pending.pop(pending_key, None)
+            try:
+                save_json(FEISHU_PENDING_FILE, feishu_pending)
+            except Exception as e:
+                print(f"  ⚠ 飞书待处理状态清理失败, 产品已生成: {e}")
     return n
 
 
@@ -968,7 +1026,13 @@ def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cf
         print(f"  同一编码按 1 个产品处理 ({len(items)} 帖, 从旧到新)")
     else:
         print(f"  AI 分组中 ({len(items)} 帖)...")
-        groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}")
+        try:
+            groups = group_products_ai(
+                ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}"
+            )
+        except RuntimeError as e:
+            print(f"  ❌ {e}; 自动模式停止, 请用默认交互流程人工确认分组")
+            return 0
     print(f"  分为 {len(groups)} 个产品")
     return process_groups(
         supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
@@ -1141,8 +1205,14 @@ def cmd_preview(config, progress, data, code=""):
         if not items:
             print(f"  {name}: 无新内容, 跳过"); continue
         print(f"  {name}: AI 分组中 ({len(items)} 帖)...")
-        groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{aid[-8:]}")
         posts = sorted(items, key=_item_order)
+        try:
+            groups = group_products_ai(
+                ai_cfg, posts, TMP_ROOT / f"grpcache_{aid[-8:]}"
+            )
+        except RuntimeError as e:
+            print(f"  ⚠ {name}: {e}, 已改为每帖一个产品, 请在预览页人工调整边界")
+            groups = [[it] for it in posts]
         # 由 groups 反推 boundaries
         gid = {}
         for i, g in enumerate(groups):
@@ -1338,27 +1408,20 @@ def _range_anchor_problem(anchor_json_path, expected_aid, date_str, start_prefix
     return problem
 
 
+def _chrome_download_paths(base):
+    downloads = Path.home() / "Downloads"
+    chrome_name = re.compile(rf"^{re.escape(base)}(?: \(\d+\))?\.json$")
+    return [
+        p for p in downloads.iterdir() if chrome_name.fullmatch(p.name)
+    ] if downloads.exists() else []
+
+
 def pick_newest_download(base):
-    """Downloads 里 base*.json 取 mtime 最新的一个, 删掉其余旧副本,
-    把最新的规范化成 base.json 返回其路径; 没有则 None。
-    解决 Chrome 去重改名 (scrape_all (1).json) + 历史副本堆积。"""
-    dls = sorted((Path.home() / "Downloads").glob(f"{base}*.json"),
-                 key=lambda p: p.stat().st_mtime)
+    """非破坏性选取 Downloads 里最新的 base.json / base (N).json."""
+    dls = sorted(_chrome_download_paths(base), key=lambda p: p.stat().st_mtime)
     if not dls:
         return None
-    newest = dls[-1]
-    for p in dls[:-1]:
-        try:
-            p.unlink()
-        except Exception:
-            pass
-    canon = newest.parent / f"{base}.json"
-    if newest != canon:
-        try:
-            newest.replace(canon); newest = canon
-        except Exception:
-            pass
-    return newest
+    return dls[-1]
 
 
 def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code="",
@@ -1411,7 +1474,7 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
 
     all_dl = Path(scrape_path)
     # 清掉残留的深挖文件, 让 Chrome 写出干净的 scrape_anchor.json 而不是 (1)
-    for p in (Path.home() / "Downloads").glob("scrape_anchor*.json"):
+    for p in _chrome_download_paths("scrape_anchor"):
         try: p.unlink()
         except Exception: pass
     # 记录开始时刻, 忽略更早的旧文件

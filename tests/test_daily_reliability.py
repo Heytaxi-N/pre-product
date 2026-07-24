@@ -217,7 +217,9 @@ class DailyReliabilityTests(unittest.TestCase):
         self.assertEqual(0, count)
         self.assertEqual({}, progress)
         create_folder.assert_not_called()
-        save.assert_not_called()
+        self.assertFalse(
+            any(call.args[0] == pick_products.PROGRESS_FILE for call in save.call_args_list)
+        )
 
     def test_group_products_ai_uses_update_order_and_gap(self):
         update_first = make_item(
