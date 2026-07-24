@@ -67,9 +67,14 @@ python3 pick_products.py
 
 ```bash
 python3 pick_products.py run 晨星外贸06 0708d
+
+# 同一供货商一次下载多个编码,每个编码独立作为一个商品
+python3 pick_products.py run 晨星外贸06 0708d 0712c
 ```
 
 定向模式把同一编码的帖子视为一个产品,并弹出「分类预览」供拖拽排序、删图和标记尺码表。它**不推进进度**,下次跑仍能拿到这批。
+
+多个编码按命令中的顺序逐项深挖和处理。每个编码独立弹出一个排序预览;完成当前商品后才进入下一个。某个编码失败时会继续处理其余编码,最后统一汇总成功和失败。
 
 图像模型未配置、密钥失效或调用异常时,脚本跳过 AI 分类,按帖子发布时间从旧到新、每帖图片原顺序下载,不会因为分类失败丢图。
 
@@ -79,6 +84,11 @@ python3 pick_products.py run 晨星外贸06 0708d
 
 ```bash
 python3 pick_products.py anchor 南在南方 凯乐石女款裙裤 04-30
+
+# 每 3 个参数是一组:供货商、关键词、日期
+python3 pick_products.py anchor \
+  南在南方 凯乐石女款裙裤 04-30 \
+  晓豪 宽松透气 07-10
 ```
 
 流程:
@@ -92,12 +102,19 @@ python3 pick_products.py anchor 南在南方 凯乐石女款裙裤 04-30
 
 分段不调 AI(纯看图数+文案),只有图片分类排序才用 AI。不推进进度。
 
+批量锚点按三元组顺序逐项执行。一个关键词如果落在多个不同占位区间,每个实际商品都会单独弹出排序预览。
+
 ### 首尾标题定向(没有占位图时)
 
 提供日期以及首帖、尾帖标题开头的几个字,下载首尾两帖和中间的全部帖子:
 
 ```bash
 python3 pick_products.py range 晓豪 07-17 "T10" "26版"
+
+# 每 4 个参数是一组:供货商、日期、起始标题、结束标题
+python3 pick_products.py range \
+  晓豪 07-17 "T10" "26版" \
+  南在南方 07-17 "T10" "26版"
 ```
 
 首次使用或项目更新后,先运行 `python3 pick_products.py bookmark`,用安装页里的新版按钮替换浏览器书签。执行 `range` 命令后,脚本会打开对应相册并等待下载;在这个页面点击「🛒 抓挑品数据」即可继续。
@@ -110,6 +127,7 @@ python3 pick_products.py range 晓豪 07-17 "T10" "26版"
 4. 深挖会保留转发形成的商品素材,只排除置顶帖,避免目标帖子在清洗时被漏掉。
 5. 找到目标日期后,连续两页没有当天帖子就停止;翻满 10 页仍未形成完整范围时会停止处理,不会使用残缺数据。
 6. 该模式不依赖占位图,整段作为一个产品进入排序预览,并且不推进日常进度。
+7. 批量条件逐项深挖并逐商品预览;单项失败不会中断后续条件,结束时统一汇总。
 
 **常见问题**
 
@@ -118,9 +136,9 @@ python3 pick_products.py range 晓豪 07-17 "T10" "26版"
 ### 单独入口(给自动化脚本用)
 
 - `python3 pick_products.py bookmark` — 生成/更新书签安装页 + 兜底 console 脚本
-- `python3 pick_products.py run [供货商] [编码]` — 直接跑;带编码时弹分类预览,不带编码时不弹
-- `python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD>` — 锚点定向
-- `python3 pick_products.py range <供货商> <日期MM-DD> <起始标题前缀> <结束标题前缀>` — 首尾标题定向
+- `python3 pick_products.py run [供货商] [编码1] [编码2...]` — 同一供货商多编码逐项处理;不带编码时走日常模式
+- `python3 pick_products.py anchor <供货商> <关键词> <日期> [<供货商> <关键词> <日期>...]` — 每 3 项一组
+- `python3 pick_products.py range <供货商> <日期> <起始标题> <结束标题> [...]` — 每 4 项一组
 - `python3 pick_products.py process <confirmed.json>` — 只处理已确认的分组文件
 
 环境变量:`SUPPLIERS=`、`CODE=`、`MAX_PRODUCTS=`、`SCRAPE_JSON=`。

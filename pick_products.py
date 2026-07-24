@@ -675,7 +675,8 @@ def _video_frame_data_url(path):
     return ""
 
 
-def build_classify_preview_html(supplier_name, prepared, out_path):
+def build_classify_preview_html(
+        supplier_name, prepared, out_path, review_label="", confirm_base="分类确认"):
     """排序预览: 按 AI 排好的顺序展示每张图, 拖拽重排 + 删除 + 标记尺码表。
     导出 分类确认.json = {supplier, prods:[{order:[存活id新序], sizes:[标为尺码表的id]}]}。
     prepared 每项含 sorted_imgs:[(path,cat,score,color)] (已排好序)。"""
@@ -688,7 +689,12 @@ def build_classify_preview_html(supplier_name, prepared, out_path):
                          "thumb": _video_frame_data_url(t[0]) if is_vid else _img_data_url(t[0]),
                          "src": t[0].resolve().as_uri() if is_vid else ""})
         prods.append({"gi": pr["gi"], "time": pr["latest_time"], "imgs": imgs})
-    payload = json.dumps({"supplier": supplier_name, "prods": prods}, ensure_ascii=False)
+    payload = json.dumps({
+        "supplier": supplier_name,
+        "label": review_label or supplier_name,
+        "confirmName": f"{confirm_base}.json",
+        "prods": prods,
+    }, ensure_ascii=False).replace("<", "\\u003c")
     html = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>排序预览</title>
@@ -721,7 +727,7 @@ h2{margin:0;font-size:16px}
 #hover-preview{display:none;position:fixed;z-index:100;pointer-events:none;width:min(560px,calc(100vw - 16px));height:min(640px,70vh);padding:8px;box-sizing:border-box;border-radius:8px;background:#111;box-shadow:0 12px 36px rgba(0,0,0,.35);align-items:center;justify-content:center}
 #hover-preview img,#hover-preview video{display:block;max-width:100%;max-height:100%;object-fit:contain}
 </style></head><body>
-<header><h2>🖼️ 排序预览 — 拖动排序 · × 删图</h2><button id="confirm">✅ 完成并生成</button></header>
+<header><h2 id="preview-title">🖼️ 排序预览 — 拖动排序 · × 删图</h2><button id="confirm">✅ 完成并生成</button></header>
 <div class="hint">图片按当前处理顺序展示。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br>某张是<b>尺码表</b>但没识别出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
 <div id="app"></div>
 <div id="hover-preview" aria-hidden="true"></div>
@@ -729,6 +735,8 @@ h2{margin:0;font-size:16px}
 const D=__PAYLOAD__;
 const app=document.getElementById('app');
 const hoverPreview=document.getElementById('hover-preview');
+document.title=D.label+' · 排序预览';
+document.getElementById('preview-title').textContent='🖼️ '+D.label+' — 拖动排序 · × 删图';
 let dragEl=null;
 function renumber(box){[...box.children].forEach((c,i)=>{const n=c.querySelector('.num');if(n)n.textContent=i+1;});}
 function hidePreview(){
@@ -799,9 +807,9 @@ document.getElementById('confirm').onclick=()=>{
     sizes:[...box.children].filter(c=>c.classList.contains('sz')).map(c=>+c.dataset.id)
   }));
   const blob=new Blob([JSON.stringify({supplier:D.supplier,prods:prods})],{type:'application/json'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='分类确认.json';
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=D.confirmName;
   document.body.appendChild(a);a.click();
-  alert('已下载 分类确认.json — 回到终端继续');
+  alert('已下载 '+D.confirmName+' — 回到终端继续');
 };
 </script></body></html>"""
     out_path.write_text(html.replace("__PAYLOAD__", payload), encoding="utf-8")
@@ -823,12 +831,20 @@ def _open_in_browser(path):
         pass
 
 
-def wait_for_classify_review(supplier_name, prepared, timeout=600):
+def wait_for_classify_review(
+        supplier_name, prepared, timeout=600, review_id="", review_label="",
+        raise_interrupt=False):
     """弹排序预览, 等 分类确认.json。返回 orders(按 prepared 顺序的存活id列表)或 None。"""
-    out = SCRIPT_DIR / "分类预览.html"
-    build_classify_preview_html(supplier_name, prepared, out)
+    safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", review_id).strip("_")
+    suffix = f"_{safe_id}" if safe_id else ""
+    out = SCRIPT_DIR / f"分类预览{suffix}.html"
+    confirm_base = f"分类确认{suffix}"
+    build_classify_preview_html(
+        supplier_name, prepared, out,
+        review_label=review_label, confirm_base=confirm_base,
+    )
     # 清残留, 避免 Chrome 把新文件改名成 分类确认 (1).json
-    for p in _chrome_download_paths("分类确认"):
+    for p in _chrome_download_paths(confirm_base):
         try: p.unlink()
         except Exception: pass
     _open_in_browser(out)
@@ -840,7 +856,7 @@ def wait_for_classify_review(supplier_name, prepared, timeout=600):
     try:
         while time.time() < end:
             time.sleep(1)
-            p = pick_newest_download("分类确认")
+            p = pick_newest_download(confirm_base)
             if p and p.stat().st_mtime > start:
                 s1 = p.stat().st_size; time.sleep(0.5)
                 if p.stat().st_size != s1:
@@ -854,16 +870,19 @@ def wait_for_classify_review(supplier_name, prepared, timeout=600):
                     print(f"  ⚠ 分类确认读失败({e}), 按当前顺序")
                     return None
     except KeyboardInterrupt:
+        if raise_interrupt:
+            raise
         print("\n  已跳过, 按当前顺序")
     print("  超时, 按当前顺序")
     return None
 
 
 def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
-                   advance_progress=True, review=None, order_key=_item_order):
+                   advance_progress=True, review=None, order_key=_item_order,
+                   review_id="", review_label="", raise_interrupt=False):
     """按给定分组处理: 下载→去重→分类→排序→(可选拖拽/删图)→飞书→建文件夹. 返回产品数.
     advance_progress=False 时不推进按天进度(定向/批量下载用).
-    review=None: 按环境变量 SKIP_REVIEW 决定, 默认弹排序预览; run 自动化传 review=False。"""
+    review=None: 按环境变量 SKIP_REVIEW 决定, 默认弹排序预览。"""
     if MAX_PRODUCTS > 0:
         groups = groups[:MAX_PRODUCTS]
     if review is None:
@@ -879,7 +898,8 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         texts = [it["title"] for it in group_asc if it.get("title")]
         combined_text = "\n\n---\n\n".join(texts) if texts else "(无文案)"
         print(f"  文案: {combined_text[:60]}...")
-        tmp_dir = TMP_ROOT / f"tmp_{album_id[-8:]}_{gi}"
+        artifact_id = review_id or str(gi)
+        tmp_dir = TMP_ROOT / f"tmp_{album_id[-8:]}_{artifact_id}"
         images = download_product_images(group_asc, tmp_dir)
         if not images:
             print("  图片未完整下载或没有图片, 跳过")
@@ -917,7 +937,13 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
 
     # Phase A.5: 拖拽/删图/标尺码表 确认。edits 按 prepared 顺序, 每项 {order:[存活id], sizes:[标尺码表的id]}
     if review:
-        edits = wait_for_classify_review(supplier_name, prepared)
+        if review_id or review_label or raise_interrupt:
+            edits = wait_for_classify_review(
+                supplier_name, prepared, review_id=review_id,
+                review_label=review_label, raise_interrupt=raise_interrupt,
+            )
+        else:
+            edits = wait_for_classify_review(supplier_name, prepared)
         if edits:
             for pr, ed in zip(prepared, edits):
                 si = pr["sorted_imgs"]
@@ -951,7 +977,11 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         print(f"\n─ 产品 {pr['gi']} 最终 {len(final)} 张:")
         for i, (p, cat, *_rest) in enumerate(final, 1):
             print(f"    {i:2d}. [{cat}{' 封面' if i == 1 and cat == '合图' else ''}] {p.name}")
-        folder_name = f"{supplier_name}_{pr['latest_time'].replace(' ', '_').replace(':', '')}_{pr['gi']}"
+        folder_suffix = review_id or str(pr["gi"])
+        folder_name = (
+            f"{supplier_name}_{pr['latest_time'].replace(' ', '_').replace(':', '')}"
+            f"_{folder_suffix}"
+        )
         pending_key = None
         if feishu:
             pending_key = _feishu_pending_key(album_id, pr["goods_ids"])
@@ -1011,7 +1041,9 @@ def apply_code_filter(items, code):
     return [it for it in items if code in (it.get("title") or "")]
 
 
-def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cfg, ai_cfg, code=""):
+def process_supplier(
+        supplier_name, album_id, raw_items, progress, feishu, fs_cfg, ai_cfg,
+        code="", review_id="", review_label="", raise_interrupt=False):
     """直接处理(不预览): 过滤→AI分组→处理.
     code 非空 = 定向模式: 在全部条目里按编码筛, 跳过按天进度过滤, 且不推进进度."""
     print(f"\n{'='*50}\n处理供货商: {supplier_name}")
@@ -1041,6 +1073,9 @@ def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cf
         advance_progress=not code,
         review=bool(code),
         order_key=(lambda it: it["time_stamp"]) if code else _item_order,
+        review_id=review_id,
+        review_label=review_label,
+        raise_interrupt=raise_interrupt,
     )
 
 
@@ -1441,8 +1476,9 @@ def pick_newest_download(base):
     return dls[-1]
 
 
-def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=240, code="",
-                         force_fetch=True, range_start="", range_end=""):
+def ensure_data_for_date(
+        scrape_path, config, supplier_name, date_str, timeout=240, code="",
+        force_fetch=True, range_start="", range_end="", raise_interrupt=False):
     """前置: 确保 scrape 里有指定日期、编码或标题范围的完整数据. 必要时打开带 anchor 参数的 szwego,
     让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
     merge 到本地 scrape_all.json 后再验证.
@@ -1463,6 +1499,17 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
         print(f"⚠ 为避免 「{supplier_name}」 {target} 的素材不完整, 重新深挖目标日期窗口...")
     else:
         print(f"⚠ 本地数据没有 「{supplier_name}」 {target} 的内容, 帮你去深挖...")
+    # 先记录已存在的诊断文件。批量上一项失败时会保留它，下一项必须忽略，
+    # 但同一路径被浏览器覆盖并更新修改时间时仍应识别为新下载。
+    anchor_before = pick_newest_download("scrape_anchor")
+    anchor_before_path = anchor_before.resolve() if anchor_before else None
+    anchor_before_mtime_ns = (
+        anchor_before.stat().st_mtime_ns if anchor_before else 0
+    )
+    all_dl = Path(scrape_path)
+    start_ts = time.time() - 1
+    all_dl_orig_mtime = all_dl.stat().st_mtime if all_dl.exists() else 0
+
     # 打开带 anchor 参数的 szwego, 书签会读 URL 参数决定行为
     # 参数放 hash 前 (search), 否则 vue router 匹配失败白屏
     anchor_url = (
@@ -1489,18 +1536,23 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
     print(f"     还没装/需要更新书签: 另开终端跑 python3 pick_products.py bookmark")
     print(f"  ⏳ 监听下载... (最长 {timeout} 秒, Ctrl+C 取消)")
 
-    all_dl = Path(scrape_path)
-    # 记录开始时刻, 忽略更早的旧文件
-    start_ts = time.time() - 1
-    all_dl_orig_mtime = all_dl.stat().st_mtime if all_dl.exists() else 0
-
     try:
         end = time.time() + timeout
         while time.time() < end:
             time.sleep(1)
             # 优先看 anchor 深挖 (认 Chrome 改名的 scrape_anchor (1).json)
             anchor_dl = pick_newest_download("scrape_anchor")
-            if anchor_dl and anchor_dl.stat().st_mtime > start_ts:
+            anchor_is_new = False
+            if anchor_dl:
+                same_path = (
+                    anchor_before_path is not None
+                    and anchor_dl.resolve() == anchor_before_path
+                )
+                anchor_is_new = (
+                    (not same_path or anchor_dl.stat().st_mtime_ns > anchor_before_mtime_ns)
+                    and anchor_dl.stat().st_mtime > start_ts
+                )
+            if anchor_dl and anchor_is_new:
                 s1 = anchor_dl.stat().st_size; time.sleep(0.5)
                 if anchor_dl.stat().st_size != s1: continue
                 print(f"  ⇣ 收到深挖数据: {anchor_dl}")
@@ -1565,23 +1617,32 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
                     all_dl_orig_mtime = all_new.stat().st_mtime  # 记录已看过
     except KeyboardInterrupt:
         print("\n已取消")
+        if raise_interrupt:
+            raise
     print("超时"); return False
 
 
-def ensure_data_for_code(scrape_path, config, supplier_name, code, timeout=240):
+def ensure_data_for_code(
+        scrape_path, config, supplier_name, code, timeout=240,
+        raise_interrupt=False):
     """按供货商逐页刷新目标编码, 避免本地只有部分命中帖."""
     return ensure_data_for_date(
-        scrape_path, config, supplier_name, "", timeout=timeout, code=code, force_fetch=True)
+        scrape_path, config, supplier_name, "", timeout=timeout, code=code,
+        force_fetch=True, raise_interrupt=raise_interrupt)
 
 def ensure_data_for_range(
-        scrape_path, config, supplier_name, date_str, start_prefix, end_prefix, timeout=240):
+        scrape_path, config, supplier_name, date_str, start_prefix, end_prefix,
+        timeout=240, raise_interrupt=False):
     """刷新指定日期, 保证标题首尾之间的帖子完整."""
     return ensure_data_for_date(
         scrape_path, config, supplier_name, date_str, timeout=timeout,
-        range_start=start_prefix, range_end=end_prefix, force_fetch=True)
+        range_start=start_prefix, range_end=end_prefix, force_fetch=True,
+        raise_interrupt=raise_interrupt)
 
 
-def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
+def cmd_anchor(
+        config, progress, data, supplier_name, keyword, date_str,
+        review_prefix="", review_label="", raise_interrupt=False):
     """锚点定向: 供货商 + 日期 + title 含关键词 → 锚点前后最近占位图间的素材 → 处理.
     不推进进度.
     date_str 支持 'MM-DD' 或 'YYYY-MM-DD'. 前者补当前年份.
@@ -1663,12 +1724,29 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
     fs_cfg = config.get("feishu") or {}
     feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    n = process_groups(supplier_name, aid, all_groups, progress, feishu, fs_cfg, ai_cfg,
-                       advance_progress=False)
+    n = 0
+    for group_index, group in enumerate(all_groups, 1):
+        review_id = (
+            f"{review_prefix}_{group_index:02d}" if review_prefix
+            else (f"{group_index:02d}" if len(all_groups) > 1 else "")
+        )
+        product_label = review_label
+        if len(all_groups) > 1:
+            product_label = (
+                f"{review_label} · 商品 {group_index}/{len(all_groups)}"
+                if review_label else f"{supplier_name} · 商品 {group_index}/{len(all_groups)}"
+            )
+        n += process_groups(
+            supplier_name, aid, [group], progress, feishu, fs_cfg, ai_cfg,
+            advance_progress=False, review_id=review_id,
+            review_label=product_label, raise_interrupt=raise_interrupt,
+        )
     print(f"\n{'='*50}\n✓ 锚点定向完成, 处理 {n} 个产品 (未推进进度)")
+    return n
 
 def cmd_title_range(
-        config, progress, data, supplier_name, date_str, start_prefix, end_prefix):
+        config, progress, data, supplier_name, date_str, start_prefix, end_prefix,
+        review_id="", review_label="", raise_interrupt=False):
     """按标题首尾前缀选择连续帖子, 作为一个产品处理."""
     suppliers = config.get("suppliers", {})
     aid = suppliers.get(supplier_name)
@@ -1700,8 +1778,11 @@ def cmd_title_range(
     n = process_groups(
         supplier_name, aid, [group], progress, feishu, fs_cfg, ai_cfg,
         advance_progress=False,
+        review_id=review_id, review_label=review_label,
+        raise_interrupt=raise_interrupt,
     )
     print(f"\n{'='*50}\n✓ 首尾定向完成, 处理 {n} 个产品 (未推进进度)")
+    return n
 
 
 def cmd_process_confirmed(config, progress, confirmed_path):
@@ -1902,16 +1983,76 @@ def _apply_defaults(config):
         MAX_PRODUCTS = int(d["max_products"])
 
 
+def _parse_batch_targets(mode, args):
+    """把高级模式位置参数解析为去重后的目标元组, 保留首次出现顺序."""
+    if mode == "run":
+        if len(args) < 2:
+            return []
+        supplier = args[0]
+        targets = [(supplier, code) for code in args[1:]]
+    elif mode == "anchor":
+        if not args or len(args) % 3:
+            raise ValueError(
+                "anchor 每 3 个参数一组: <供货商> <关键词> <日期>"
+            )
+        targets = [tuple(args[i:i + 3]) for i in range(0, len(args), 3)]
+    elif mode == "range":
+        if not args or len(args) % 4:
+            raise ValueError(
+                "range 每 4 个参数一组: <供货商> <日期> <起始标题> <结束标题>"
+            )
+        targets = [tuple(args[i:i + 4]) for i in range(0, len(args), 4)]
+    else:
+        return []
+
+    seen = set()
+    unique = []
+    for target in targets:
+        if target in seen:
+            continue
+        seen.add(target)
+        unique.append(target)
+    return unique
+
+
+def _resolve_supplier(config, supplier_name):
+    """返回 config 中的规范供应商名和 album id."""
+    suppliers = config.get("suppliers", {})
+    if supplier_name in suppliers:
+        return supplier_name, suppliers[supplier_name]
+    for name, album_id in suppliers.items():
+        if supplier_name in name:
+            return name, album_id
+    return "", ""
+
+
+def _print_batch_summary(results, heading="批量完成"):
+    success = [result for result in results if result["count"] > 0]
+    failed = [result for result in results if result["count"] <= 0]
+    product_count = sum(result["count"] for result in success)
+    print(
+        f"\n{'='*50}\n{heading}: {len(results)} 项条件, "
+        f"成功 {len(success)} 项, 生成 {product_count} 个商品, "
+        f"失败 {len(failed)} 项"
+    )
+    for result in results:
+        mark = "✓" if result["count"] > 0 else "❌"
+        detail = (
+            f"{result['count']} 个商品"
+            if result["count"] > 0 else result.get("reason", "未生成商品")
+        )
+        print(f"  {mark} {result['label']} — {detail}")
+
+
 def main():
-    # 位置参数: [mode] [供货商] [编码]  (config.json 之类的 .json 不算位置参数)
+    # 位置参数: [mode] [模式参数...]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
     mode = ""
     if positional and positional[0] in ("preview", "process", "run", "bookmark", "anchor", "range"):
         mode = positional.pop(0)
+    mode_args = list(positional)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
     code_arg = positional[1] if len(positional) >= 2 else ""
-    date_arg = positional[2] if len(positional) >= 3 else ""  # anchor 专用
-    end_arg = positional[3] if len(positional) >= 4 else ""  # range 专用
 
     supplier = supplier_arg or os.environ.get("SUPPLIERS", "")
     code = code_arg or os.environ.get("CODE", "")
@@ -1938,36 +2079,211 @@ def main():
     default_scrape = Path.home() / "Downloads" / "scrape_all.json"
     env_scrape = os.environ.get("SCRAPE_JSON")
     if mode == "range":
-        if len(positional) != 4 or not (supplier_arg and code_arg and date_arg and end_arg):
-            print("用法: python3 pick_products.py range <供货商> <日期MM-DD> <起始帖标题前缀> <结束帖标题前缀>"); sys.exit(1)
+        try:
+            targets = _parse_batch_targets("range", mode_args)
+        except ValueError as e:
+            print(f"用法错误: {e}"); sys.exit(1)
         scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
-        norm_date = _normalize_date(code_arg)
-        if not ensure_data_for_range(
-            scrape_path, config, supplier_arg, norm_date, date_arg, end_arg
-        ):
-            print("❌ 未获取到完整的首尾标题范围, 无法继续"); return
-        data = load_scrape(scrape_path, config)
-        cmd_title_range(
-            config, progress, data, supplier_arg, norm_date, date_arg, end_arg
-        )
+        is_batch = len(targets) > 1
+        results = []
+        for index, (target_supplier, target_date, start_prefix, end_prefix) in enumerate(targets, 1):
+            norm_date = _normalize_date(target_date)
+            label = (
+                f"{target_supplier} · 首尾 {start_prefix} → {end_prefix} · {norm_date}"
+            )
+            review_label = f"第 {index}/{len(targets)} 项 · {label}"
+            print(f"\n[{index}/{len(targets)}] {label}")
+            try:
+                if is_batch:
+                    ready = ensure_data_for_range(
+                        scrape_path, config, target_supplier, norm_date,
+                        start_prefix, end_prefix, raise_interrupt=True,
+                    )
+                else:
+                    ready = ensure_data_for_range(
+                        scrape_path, config, target_supplier, norm_date,
+                        start_prefix, end_prefix,
+                    )
+                if not ready:
+                    print("❌ 未获取到完整的首尾标题范围, 跳过")
+                    results.append({
+                        "label": label, "count": 0, "reason": "深挖失败",
+                    })
+                    continue
+                data = load_scrape(scrape_path, config)
+                kwargs = {}
+                if is_batch:
+                    kwargs = {
+                        "review_id": f"{index:02d}_01",
+                        "review_label": review_label,
+                        "raise_interrupt": True,
+                    }
+                count = cmd_title_range(
+                    config, progress, data, target_supplier, norm_date,
+                    start_prefix, end_prefix, **kwargs,
+                ) or 0
+                results.append({
+                    "label": label, "count": count,
+                    "reason": "未找到或未生成商品",
+                })
+            except KeyboardInterrupt:
+                if not is_batch:
+                    raise
+                print("\n已取消批量任务")
+                if results:
+                    _print_batch_summary(results, heading="取消前汇总")
+                return
+            except Exception as e:
+                print(f"❌ 本项处理失败: {e}")
+                results.append({
+                    "label": label, "count": 0, "reason": str(e),
+                })
+        if is_batch:
+            _print_batch_summary(results)
         return
 
     # anchor 模式即使本地没数据也继续 (ensure_data_for_date 会深挖创建)
     if mode == "anchor":
-        if not (supplier_arg and code_arg and date_arg):
-            print("用法: python3 pick_products.py anchor <供货商> <关键词> <日期MM-DD或YYYY-MM-DD>"); sys.exit(1)
+        try:
+            targets = _parse_batch_targets("anchor", mode_args)
+        except ValueError as e:
+            print(f"用法错误: {e}"); sys.exit(1)
         scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
-        norm_date = _normalize_date(date_arg)
-        if not ensure_data_for_date(scrape_path, config, supplier_arg, norm_date):
-            print(f"❌ 未获取到 {norm_date} 的数据, 无法继续"); return
-        data = load_scrape(scrape_path, config)  # 深挖 merge 后加载
-        cmd_anchor(config, progress, data, supplier_arg, code_arg, date_arg); return
+        is_batch = len(targets) > 1
+        results = []
+        for index, (target_supplier, keyword, target_date) in enumerate(targets, 1):
+            norm_date = _normalize_date(target_date)
+            label = f"{target_supplier} · 锚点 {keyword} · {norm_date}"
+            review_label = f"第 {index}/{len(targets)} 项 · {label}"
+            print(f"\n[{index}/{len(targets)}] {label}")
+            try:
+                if is_batch:
+                    ready = ensure_data_for_date(
+                        scrape_path, config, target_supplier, norm_date,
+                        raise_interrupt=True,
+                    )
+                else:
+                    ready = ensure_data_for_date(
+                        scrape_path, config, target_supplier, norm_date,
+                    )
+                if not ready:
+                    print(f"❌ 未获取到 {norm_date} 的数据, 跳过")
+                    results.append({
+                        "label": label, "count": 0, "reason": "深挖失败",
+                    })
+                    continue
+                data = load_scrape(scrape_path, config)
+                kwargs = {}
+                if is_batch:
+                    kwargs = {
+                        "review_prefix": f"{index:02d}",
+                        "review_label": review_label,
+                        "raise_interrupt": True,
+                    }
+                count = cmd_anchor(
+                    config, progress, data, target_supplier, keyword,
+                    target_date, **kwargs,
+                ) or 0
+                results.append({
+                    "label": label, "count": count,
+                    "reason": "未找到或未生成商品",
+                })
+            except KeyboardInterrupt:
+                if not is_batch:
+                    raise
+                print("\n已取消批量任务")
+                if results:
+                    _print_batch_summary(results, heading="取消前汇总")
+                return
+            except Exception as e:
+                print(f"❌ 本项处理失败: {e}")
+                results.append({
+                    "label": label, "count": 0, "reason": str(e),
+                })
+        if is_batch:
+            _print_batch_summary(results)
+        return
 
     scrape_path = env_scrape or (str(pick_newest_download("scrape_all") or ""))
-    if mode == "run" and supplier and code:
+    run_targets = []
+    if mode == "run":
+        run_targets = _parse_batch_targets("run", mode_args)
+        if not run_targets and supplier and code:
+            run_targets = [(supplier, code)]
+    if mode == "run" and run_targets:
         scrape_path = scrape_path or str(default_scrape)
-        if not ensure_data_for_code(scrape_path, config, supplier, code):
-            print(f"❌ 深挖后仍未找到 「{supplier}」 编码「{code}」的素材"); return
+        is_batch = len(run_targets) > 1
+        fs_cfg = config.get("feishu") or {}
+        feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
+        if feishu:
+            print("✓ 飞书已配置")
+        ai_cfg = config.get("ai_vision") or {}
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        results = []
+        for index, (target_supplier, target_code) in enumerate(run_targets, 1):
+            label = f"{target_supplier} · 编码 {target_code}"
+            review_label = f"第 {index}/{len(run_targets)} 项 · {label}"
+            print(f"\n[{index}/{len(run_targets)}] {label}")
+            try:
+                if is_batch:
+                    ready = ensure_data_for_code(
+                        scrape_path, config, target_supplier, target_code,
+                        raise_interrupt=True,
+                    )
+                else:
+                    ready = ensure_data_for_code(
+                        scrape_path, config, target_supplier, target_code,
+                    )
+                if not ready:
+                    print(
+                        f"❌ 深挖后仍未找到 「{target_supplier}」"
+                        f" 编码「{target_code}」的素材"
+                    )
+                    results.append({
+                        "label": label, "count": 0, "reason": "深挖失败",
+                    })
+                    continue
+                canonical_name, aid = _resolve_supplier(config, target_supplier)
+                data = load_scrape(scrape_path, config)
+                if not aid or aid not in data:
+                    print(f"❌ 抓取数据里没有 「{target_supplier}」 的内容")
+                    results.append({
+                        "label": label, "count": 0, "reason": "供应商数据缺失",
+                    })
+                    continue
+                kwargs = {"code": target_code}
+                if is_batch:
+                    kwargs.update({
+                        "review_id": f"{index:02d}_01",
+                        "review_label": review_label,
+                        "raise_interrupt": True,
+                    })
+                count = process_supplier(
+                    canonical_name, aid, data[aid]["items"], progress,
+                    feishu, fs_cfg, ai_cfg, **kwargs,
+                )
+                results.append({
+                    "label": label, "count": count,
+                    "reason": "未找到或未生成商品",
+                })
+            except KeyboardInterrupt:
+                if not is_batch:
+                    raise
+                print("\n已取消批量任务")
+                if results:
+                    _print_batch_summary(results, heading="取消前汇总")
+                return
+            except Exception as e:
+                print(f"❌ 本项处理失败: {e}")
+                results.append({
+                    "label": label, "count": 0, "reason": str(e),
+                })
+        if is_batch:
+            _print_batch_summary(results)
+        else:
+            total = sum(result["count"] for result in results)
+            print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
+        return
     if not scrape_path:
         print(f"❌ 没找到抓取数据: {default_scrape}")
         print(f"   请先在浏览器点「🛒 抓挑品数据」书签抓一次数据。")

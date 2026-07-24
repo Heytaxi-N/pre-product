@@ -8,8 +8,8 @@ progress.json
 # 生成的预览/确认文件
 分组预览.html
 confirmed_groups.json
-分类预览.html
-分类确认.json
+分类预览*.html
+分类确认*.json
 install_bookmark.html
 paste_to_console.js
 
