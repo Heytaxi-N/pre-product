@@ -161,7 +161,7 @@ def group_products_ai(ai_cfg, items, cache_dir):
     """先用占位图(分割线)切硬边界并剔除占位帖; 段内再跑相邻 AI 图文分组.
     带占位图的供货商靠占位图切干净; 不带的沿用原逻辑.
     """
-    items = sorted(items, key=lambda x: x["time_stamp"])
+    items = sorted(items, key=_item_order)
     if len(items) <= 1:
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -187,7 +187,7 @@ def group_products_ai(ai_cfg, items, cache_dir):
         cur_groups = [[seg[0]]]
         for cur in seg[1:]:
             prev = cur_groups[-1][-1]
-            gap = (cur["time_stamp"] - prev["time_stamp"]) / 1000
+            gap = (_item_order(cur) - _item_order(prev)) / 1000
             if gap <= GROUP_MAX_GAP and _ai_same_product(ai_cfg, prev, cur, cache_dir):
                 cur_groups[-1].append(cur)
             else:
@@ -201,8 +201,11 @@ def group_products_ai(ai_cfg, items, cache_dir):
 
 # ── 图片下载 ─────────────────────────────────────────
 def download_product_images(product_items, tmp_dir):
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     paths = []
+    failed = False
     for item in product_items:
         for i, url in enumerate(item["imgsSrc"]):
             clean_url = url.split("?")[0]
@@ -214,6 +217,7 @@ def download_product_images(product_items, tmp_dir):
                     dest.write_bytes(http_get_bytes(clean_url))
                 except Exception as e:
                     print(f"  下载失败 {clean_url}: {e}")
+                    failed = True
                     continue
             paths.append(dest)
         if item.get("videoUrl"):
@@ -225,8 +229,12 @@ def download_product_images(product_items, tmp_dir):
                     dest.write_bytes(http_get_bytes(vurl))
                 except Exception as e:
                     print(f"  视频下载失败: {e}")
+                    failed = True
                     continue
             paths.append(dest)
+    if failed:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return []
     return paths
 
 
@@ -439,24 +447,32 @@ def create_product_folder(sorted_images, folder_name, output_dir):
       - 视频 → "视频NN.mp4" (独立序号)
       - 其他 → "{图片名}NN.jpg" (独立序号)
     """
+    output_dir.mkdir(parents=True, exist_ok=True)
     folder = output_dir / folder_name
-    folder.mkdir(parents=True, exist_ok=True)
+    if folder.exists():
+        raise FileExistsError(f"产品目录已存在: {folder}")
+    staging = Path(tempfile.mkdtemp(prefix=f".{folder_name}.", dir=output_dir))
     img_idx = 0
     vid_idx = 0
     size_idx = 0
     size_count = sum(1 for t in sorted_images if t[1] == "尺码表")
-    for src, cat, *_rest in sorted_images:
-        if cat == "尺码表":
-            size_idx += 1
-            name = "尺码表" if size_count == 1 else f"尺码表{size_idx:02d}"
-        elif cat == "视频":
-            vid_idx += 1
-            name = f"视频{vid_idx:02d}"
-        else:
-            img_idx += 1
-            name = f"{folder_name}{img_idx:02d}"
-        dest = folder / f"{name}{src.suffix}"
-        shutil.copy2(src, dest)
+    try:
+        for src, cat, *_rest in sorted_images:
+            if cat == "尺码表":
+                size_idx += 1
+                name = "尺码表" if size_count == 1 else f"尺码表{size_idx:02d}"
+            elif cat == "视频":
+                vid_idx += 1
+                name = f"视频{vid_idx:02d}"
+            else:
+                img_idx += 1
+                name = f"{folder_name}{img_idx:02d}"
+            dest = staging / f"{name}{src.suffix}"
+            shutil.copy2(src, dest)
+        staging.rename(folder)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     print(f"  ✓ 文件夹: {folder} ({len(sorted_images)} 个文件)")
     return folder
 
@@ -563,15 +579,44 @@ def _progress_date(progress, album_id):
         return ""
     if isinstance(v, (int, float)):
         return datetime.fromtimestamp(v / 1000).strftime("%Y-%m-%d")
+    if isinstance(v, dict):
+        return str(v.get("cutoff_date") or "")
     return str(v)
 
 def filter_new_items(album_id, raw_items, progress):
-    """按天进度过滤: 首次只取最新日期; 之后取日期严格晚于上次处理日期的."""
-    last_date = _progress_date(progress, album_id)
-    if not last_date and raw_items:
+    """旧进度按日期过滤; 新进度同时记录成功 goods_id, 支持同日增量和失败重试."""
+    state = progress.get(album_id)
+    if state is None and raw_items:
         max_date = max(_item_date(it) for it in raw_items)
         return [it for it in raw_items if _item_date(it) == max_date]
+    if isinstance(state, dict):
+        cutoff = str(state.get("cutoff_date") or "")
+        processed = set(state.get("processed_ids") or [])
+        return [
+            it for it in raw_items
+            if _item_date(it) >= cutoff and it.get("goods_id") not in processed
+        ]
+    last_date = _progress_date(progress, album_id)
     return [it for it in raw_items if _item_date(it) > last_date]
+
+
+def _record_processed_ids(progress, album_id, groups, processed_ids):
+    """记录实际成功落盘的帖子; processed_ids 可跨日期增长, 避免部分失败被跳过."""
+    state = progress.get(album_id)
+    if isinstance(state, dict):
+        cutoff = str(state.get("cutoff_date") or "")
+        done = set(state.get("processed_ids") or [])
+    else:
+        cutoff = _progress_date(progress, album_id)
+        done = set()
+    if not cutoff:
+        cutoff = min(_item_date(it) for group in groups for it in group)
+    done.update(processed_ids)
+    progress[album_id] = {
+        "cutoff_date": cutoff,
+        "processed_ids": sorted(done),
+    }
+    save_json(PROGRESS_FILE, progress)
 
 
 def _img_data_url(p):
@@ -784,7 +829,7 @@ def wait_for_classify_review(supplier_name, prepared, timeout=600):
 
 
 def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
-                   advance_progress=True, review=None):
+                   advance_progress=True, review=None, order_key=_item_order):
     """按给定分组处理: 下载→去重→分类→排序→(可选拖拽/删图)→飞书→建文件夹. 返回产品数.
     advance_progress=False 时不推进按天进度(定向/批量下载用).
     review=None: 按环境变量 SKIP_REVIEW 决定, 默认弹排序预览; run 自动化传 review=False。"""
@@ -796,8 +841,9 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
     # Phase A: 下载 → 去重 → 分类 → 排序, 暂存(临时目录先不删)
     prepared = []
     for gi, group in enumerate(groups, 1):
-        group_asc = sorted(group, key=lambda x: x["time_stamp"])
-        latest_time = datetime.fromtimestamp(group_asc[-1]["time_stamp"] / 1000).strftime("%Y-%m-%d %H:%M")
+        group_asc = sorted(group, key=order_key)
+        latest_item = max(group, key=lambda x: x["time_stamp"])
+        latest_time = datetime.fromtimestamp(latest_item["time_stamp"] / 1000).strftime("%Y-%m-%d %H:%M")
         print(f"\n─ 产品 {gi}/{len(groups)} ({len(group)} 帖, {latest_time})")
         texts = [it["title"] for it in group_asc if it.get("title")]
         combined_text = "\n\n---\n\n".join(texts) if texts else "(无文案)"
@@ -805,7 +851,9 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         tmp_dir = TMP_ROOT / f"tmp_{album_id[-8:]}_{gi}"
         images = download_product_images(group_asc, tmp_dir)
         if not images:
-            print("  无图片, 跳过")
+            print("  图片未完整下载或没有图片, 跳过")
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             continue
         # 相同的图只保留1张(按内容哈希去重, 保持顺序)
         # ponytail: 精确字节去重; 需要"视觉近似"去重时再上感知哈希
@@ -831,6 +879,7 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         else:
             sorted_imgs = sort_by_new_rule(classified)
         prepared.append({"gi": gi, "latest_time": latest_time, "combined_text": combined_text,
+                         "goods_ids": [it["goods_id"] for it in group],
                          "tmp_dir": tmp_dir, "sorted_imgs": sorted_imgs, "final": sorted_imgs})
     if not prepared:
         return 0
@@ -878,15 +927,22 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                 folder_name = feishu.wait_for_field(record_id, fs_cfg.get("img_name_field", "图片名"))
                 print(f"  ✓ 图片名: {folder_name}")
             except Exception as e:
-                print(f"  ⚠ 飞书失败, 用默认文件夹名: {e}")
-        create_product_folder(final, folder_name, OUTPUT_DIR)
+                print(f"  ⚠ 飞书失败, 本产品不生成且不记进度: {e}")
+                if pr["tmp_dir"].exists():
+                    shutil.rmtree(pr["tmp_dir"], ignore_errors=True)
+                continue
+        try:
+            create_product_folder(final, folder_name, OUTPUT_DIR)
+        except Exception as e:
+            print(f"  ⚠ 文件夹生成失败, 本产品不记进度: {e}")
+            if pr["tmp_dir"].exists():
+                shutil.rmtree(pr["tmp_dir"], ignore_errors=True)
+            continue
         if pr["tmp_dir"].exists():
             shutil.rmtree(pr["tmp_dir"])
         n += 1
-
-    if groups and advance_progress:
-        progress[album_id] = max(_item_date(it) for group in groups for it in group)
-        save_json(PROGRESS_FILE, progress)
+        if advance_progress:
+            _record_processed_ids(progress, album_id, groups, pr["goods_ids"])
     return n
 
 
@@ -914,8 +970,12 @@ def process_supplier(supplier_name, album_id, raw_items, progress, feishu, fs_cf
         print(f"  AI 分组中 ({len(items)} 帖)...")
         groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{album_id[-8:]}")
     print(f"  分为 {len(groups)} 个产品")
-    return process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
-                          advance_progress=not code, review=bool(code))
+    return process_groups(
+        supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
+        advance_progress=not code,
+        review=bool(code),
+        order_key=(lambda it: it["time_stamp"]) if code else _item_order,
+    )
 
 
 # ── 预览确认界面 ──────────────────────────────────────
@@ -1082,7 +1142,7 @@ def cmd_preview(config, progress, data, code=""):
             print(f"  {name}: 无新内容, 跳过"); continue
         print(f"  {name}: AI 分组中 ({len(items)} 帖)...")
         groups = group_products_ai(ai_cfg, items, TMP_ROOT / f"grpcache_{aid[-8:]}")
-        posts = sorted(items, key=lambda x: x["time_stamp"])
+        posts = sorted(items, key=_item_order)
         # 由 groups 反推 boundaries
         gid = {}
         for i, g in enumerate(groups):
@@ -1094,6 +1154,7 @@ def cmd_preview(config, progress, data, code=""):
             "supplier": name, "albumId": aid,
             "posts": [{"goods_id": p["goods_id"], "title": p.get("title", ""),
                        "imgsSrc": p.get("imgsSrc", []), "time_stamp": p["time_stamp"],
+                       "update_time": p.get("update_time"),
                        "videoUrl": p.get("videoUrl", ""),
                        "thumb": thumb(p["imgsSrc"][0]) if p.get("imgsSrc") else "",
                        "imgs": len(p.get("imgsSrc", [])),
@@ -1619,6 +1680,27 @@ const fetchOne=async(aid,pageTs)=>{
   const u='https://www.szwego.com/album/personal/new?&albumId='+aid+'&searchValue=&searchImg=&startDate=&endDate=&sourceId=&requestDataType='+(pageTs?'&slipType=1&timestamp='+pageTs:'');
   const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:''});return await r.json();
 };
+const fetchDaily=async aid=>{
+  const all=[],seen=new Set();let pageTs='',pages=0,latestDate='',foundLatest=false,misses=0,hasMore=false;const DAILY_MAX=50;
+  while(pages<DAILY_MAX){
+    const d=await fetchOne(aid,pageTs);
+    const raw=d.result&&d.result.items?d.result.items:[];
+    if(raw.length===0)break;
+    const items=filt(raw);
+    if(!latestDate&&items.length)latestDate=items.map(itemDate).sort().pop();
+    const hasLatest=!!latestDate&&items.some(i=>itemDate(i)===latestDate);
+    if(hasLatest){foundLatest=true;misses=0;}else if(foundLatest){misses++;}
+    for(const it of items){if(!seen.has(it.goods_id)){seen.add(it.goods_id);all.push(it);}}
+    pages++;
+    hasMore=!!(d.result.pagination&&d.result.pagination.isLoadMore);
+    if(foundLatest&&misses>=2)break;
+    if(!hasMore)break;
+    pageTs=d.result.pagination.pageTimestamp;
+    await new Promise(r=>setTimeout(r,150));
+  }
+  if(pages===DAILY_MAX&&hasMore&&misses<2)throw new Error('日常抓取达到分页上限');
+  return all;
+};
 const dl=(data,fname)=>{
   const blob=new Blob([JSON.stringify(data)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fname;
@@ -1665,7 +1747,7 @@ if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
 }
 const out={data:{}};let ok=0,err=0;
 for(const [name,aid] of Object.entries(SUP)){
-  try{const d=await fetchOne(aid,'');out.data[aid]={supplier:name,items:filt(d.result&&d.result.items?d.result.items:[])};ok++;}
+  try{out.data[aid]={supplier:name,items:await fetchDaily(aid)};ok++;}
   catch(e){out.data[aid]={supplier:name,items:[]};err++;}
   await new Promise(r=>setTimeout(r,200));
 }
