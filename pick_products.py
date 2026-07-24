@@ -113,13 +113,14 @@ def _ai_same_product(ai_cfg, a, b, cache_dir):
 
 def _is_placeholder(ai_cfg, item, cache_dir):
     """判断某帖是否'与服装无关的占位/分割图'.
-    结构性前置: 必须 1 图 + 空文案. 不满足 → 一定不是占位图, 直接 False (免 AI 调用).
+    结构性前置: 必须 1 图 + 空文案 + 无视频. 不满足 → 一定不是占位图, 直接 False (免 AI 调用).
     满足后再用 AI 视觉确认是不是"与服装无关".
     三态返回: True 占位 / False 商品 / None 调用失败.
     """
     imgs = item.get("imgsSrc") or []
     title = (item.get("title") or "").strip()
-    if len(imgs) != 1 or title:
+    has_video = bool(item.get("videoUrl") or item.get("videoURL"))
+    if len(imgs) != 1 or title or has_video:
         return False  # 结构不符 → 一定不是占位, 免 AI
     base_url = (ai_cfg or {}).get("base_url", "").rstrip("/")
     api_key = (ai_cfg or {}).get("api_key", "")
@@ -235,8 +236,9 @@ def download_product_images(product_items, tmp_dir):
                     failed = True
                     continue
             paths.append(dest)
-        if item.get("videoUrl"):
-            vurl = item["videoUrl"].split("?")[0]
+        video_url = item.get("videoUrl") or item.get("videoURL")
+        if video_url:
+            vurl = video_url.split("?")[0]
             ext = Path(vurl).suffix or ".mp4"
             dest = tmp_dir / f"{item['goods_id'][-8:]}_video{ext}"
             if not dest.exists():
@@ -1317,9 +1319,16 @@ def _merge_anchor_into_scrape(scrape_path, anchor_json_path):
             if _item_display_date(it) != scan_date
         ] + list(items)
     else:
+        base_items = existing["items"]
+        if meta.get("dateWindow") is True and items:
+            oldest_captured_order = min(_item_order(it) for it in items)
+            base_items = [
+                it for it in base_items
+                if _item_order(it) < oldest_captured_order
+            ]
         incoming = {it["goods_id"]: it for it in items}
-        existing_ids = {it["goods_id"] for it in existing["items"]}
-        merged_items = [incoming.get(it["goods_id"], it) for it in existing["items"]]
+        existing_ids = {it["goods_id"] for it in base_items}
+        merged_items = [incoming.get(it["goods_id"], it) for it in base_items]
         merged_items.extend(it for gid, it in incoming.items() if gid not in existing_ids)
     existing = {
         **existing,
@@ -1365,12 +1374,20 @@ def _date_anchor_problem(anchor_json_path, expected_aid, date_str):
     meta = anchor.get("anchor") or {}
     if meta.get("date") != date_str:
         return "下载文件与本次请求日期不符"
-    if meta.get("fullScan") is not True:
+    if (
+        "incomplete" not in meta
+        or (
+            meta.get("dateWindow") is not True
+            and meta.get("fullScan") is not True
+        )
+    ):
         return "仍在使用旧版书签, 请从 install_bookmark.html 重新替换"
     if meta.get("incomplete"):
         return (f"深挖未完成: {meta.get('pages', 0)} 页, "
                 f"停止原因 {meta.get('stopReason', 'unknown')}")
     items = anchor.get("items", [])
+    if any(it.get("update_time") is None for it in items):
+        return "深挖数据缺少 update_time, 无法还原真实排序"
     if not any(_item_display_date(it) == date_str for it in items):
         return (f"未抓到 {date_str}: 原始 {meta.get('rawCount', '?')} 条, "
                 f"清洗后 {len(items)} 条, {meta.get('pages', 0)} 页, "
@@ -1441,9 +1458,9 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
     if target_exists and not force_fetch:
         return True
     if range_mode:
-        print(f"⚠ 为确保 「{supplier_name}」 {target} 完整, 重新深挖全部分页...")
+        print(f"⚠ 为确保 「{supplier_name}」 {target} 完整, 重新深挖目标日期窗口...")
     elif target_exists:
-        print(f"⚠ 为避免 「{supplier_name}」 {target} 的素材不完整, 重新深挖全部分页...")
+        print(f"⚠ 为避免 「{supplier_name}」 {target} 的素材不完整, 重新深挖目标日期窗口...")
     else:
         print(f"⚠ 本地数据没有 「{supplier_name}」 {target} 的内容, 帮你去深挖...")
     # 打开带 anchor 参数的 szwego, 书签会读 URL 参数决定行为
@@ -1473,10 +1490,6 @@ def ensure_data_for_date(scrape_path, config, supplier_name, date_str, timeout=2
     print(f"  ⏳ 监听下载... (最长 {timeout} 秒, Ctrl+C 取消)")
 
     all_dl = Path(scrape_path)
-    # 清掉残留的深挖文件, 让 Chrome 写出干净的 scrape_anchor.json 而不是 (1)
-    for p in _chrome_download_paths("scrape_anchor"):
-        try: p.unlink()
-        except Exception: pass
     # 记录开始时刻, 忽略更早的旧文件
     start_ts = time.time() - 1
     all_dl_orig_mtime = all_dl.stat().st_mtime if all_dl.exists() else 0
@@ -1603,14 +1616,19 @@ def cmd_anchor(config, progress, data, supplier_name, keyword, date_str):
         print(f"❌ 没有 title 含「{keyword}」的条目"); return
     print(f"  匹配锚点 {len(matched_ids)} 条")
 
-    # 5. 占位图 = 只有 1 张图 且 无任何文案.
+    # 5. 占位图 = 只有 1 张图、无任何文案且不是视频帖.
     #    锚点前后最近的占位图就是该产品边界.
     ai_cfg = config.get("ai_vision") or {}
     matched_indices = [i for i, it in enumerate(ordered_items) if it["goods_id"] in matched_ids]
 
     def _is_struct_placeholder(item):
         imgs = item.get("imgsSrc") or []
-        return len(imgs) == 1 and not (item.get("title") or "").strip()
+        has_video = bool(item.get("videoUrl") or item.get("videoURL"))
+        return (
+            len(imgs) == 1
+            and not (item.get("title") or "").strip()
+            and not has_video
+        )
 
     placeholder_indices = [i for i, it in enumerate(ordered_items) if _is_struct_placeholder(it)]
     print(f"  完整排序识别占位图 {len(placeholder_indices)} 张")
@@ -1780,7 +1798,7 @@ if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
   let aid=null,name=anchorSup;
   for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
   if(!aid){alert('未找到供货商: '+anchorSup);return;}
-  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,foundRangeDate=false,missesAfterRangeDate=0,stopReason='end';const MAX=50;const RANGE_MAX=10;const pageLimit=rangeDate?RANGE_MAX:MAX;
+  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,missesAfterDate=0,foundRangeDate=false,missesAfterRangeDate=0,stopReason='end';const MAX=50;const RANGE_MAX=10;const pageLimit=rangeDate?RANGE_MAX:MAX;
   while(pages<pageLimit){
     let d;try{d=await fetchOne(aid,pageTs);}catch(e){incomplete=true;stopReason='network';break;}
     const rawItems=d.result&&d.result.items?d.result.items:[];
@@ -1792,18 +1810,19 @@ if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
     const pageHasDate=anchorDate&&items.some(i=>itemDate(i)===anchorDate);
     const pageHasRangeDate=rangeDate&&items.some(i=>itemDate(i)===rangeDate);
     if(pageHasCode){foundCode=true;missesAfterCode=0;}else if(anchorCode&&foundCode){missesAfterCode++;}
-    if(pageHasDate)foundDate=true;
+    if(pageHasDate){foundDate=true;missesAfterDate=0;}else if(anchorDate&&foundDate){missesAfterDate++;}
     if(pageHasRangeDate){foundRangeDate=true;missesAfterRangeDate=0;}else if(rangeDate&&foundRangeDate){missesAfterRangeDate++;}
     all.push(...rangeItems);pages++;
     hasMore=!!(d.result.pagination&&d.result.pagination.isLoadMore);
     if(anchorCode&&foundCode&&missesAfterCode>=2){stopReason='boundary';break;}
+    if(anchorDate&&foundDate&&missesAfterDate>=2){stopReason='date-boundary';break;}
     if(rangeDate&&foundRangeDate&&missesAfterRangeDate>=2){stopReason='date-boundary';break;}
     if(!hasMore)break;
     pageTs=d.result.pagination.pageTimestamp;
     await new Promise(r=>setTimeout(r,150));
   }
   if(pages===pageLimit&&hasMore&&stopReason==='end'){incomplete=true;stopReason='limit';}
-  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,rangeDate,rangeStart,rangeEnd,pages,rawCount,foundDate,incomplete,stopReason,fullScan:!!anchorDate,dateScan:!!rangeDate}},'scrape_anchor.json');
+  dl({supplier:name,albumId:aid,items:all,anchor:{supplier:anchorSup,date:anchorDate,code:anchorCode,rangeDate,rangeStart,rangeEnd,pages,rawCount,foundDate,incomplete,stopReason,fullScan:false,dateWindow:!!anchorDate,dateScan:!!rangeDate}},'scrape_anchor.json');
   const target=anchorCode||anchorDate||(rangeDate+' '+rangeStart+' → '+rangeEnd);
   alert((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+target+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;

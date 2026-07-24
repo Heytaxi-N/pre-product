@@ -112,6 +112,48 @@ class AnchorTests(unittest.TestCase):
             [["anchor", "detail"]], self.capture_anchor_groups(items, "2026-04-30")
         )
 
+    def test_anchor_keeps_untitled_video_between_placeholders(self):
+        items = [
+            make_item("opening-placeholder", 0, "", 1, update_minute=0),
+            make_item("video", 1, "", 1, update_minute=1),
+            make_item("detail", 2, "", 4, update_minute=2),
+            make_item(
+                "anchor", 3, "凯乐石女款裙裤 MOVE PACK", 4, update_minute=3
+            ),
+            make_item("closing-placeholder", 4, "", 1, update_minute=4),
+        ]
+        items[1]["videoUrl"] = "https://example.com/product.mp4"
+
+        self.assertEqual(
+            [["video", "detail", "anchor"]],
+            self.capture_anchor_groups(items),
+        )
+
+    def test_placeholder_check_treats_untitled_video_as_product(self):
+        item = make_item("video", 1, "", 1)
+        item["videoUrl"] = "https://example.com/product.mp4"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIs(
+                pick_products._is_placeholder({}, item, Path(tmp)),
+                False,
+            )
+
+    def test_download_accepts_legacy_video_url_field(self):
+        item = make_item("legacy-video", 1, "", 0)
+        item.pop("videoUrl")
+        item["videoURL"] = "https://example.com/product.mp4"
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(pick_products, "http_get_bytes", return_value=b"video"):
+            paths = pick_products.download_product_images(
+                [item], Path(tmp) / "download"
+            )
+            contents = [path.read_bytes() for path in paths]
+
+        self.assertEqual([".mp4"], [path.suffix for path in paths])
+        self.assertEqual([b"video"], contents)
+
     def test_anchor_merge_refreshes_existing_items(self):
         with tempfile.TemporaryDirectory() as tmp:
             scrape_path = Path(tmp) / "scrape_all.json"
@@ -154,6 +196,60 @@ class AnchorTests(unittest.TestCase):
             [item["goods_id"] for item in merged["data"]["album-1"]["items"]],
         )
 
+    def test_date_window_replaces_only_the_captured_order_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scrape_path = Path(tmp) / "scrape_all.json"
+            anchor_path = Path(tmp) / "scrape_anchor.json"
+            stale_target = make_item("stale-target", 1, "旧目标日内容", 2)
+            other_day = make_item("other-day", 2, "其他日期", 2)
+            other_day["time_stamp"] = int(
+                datetime(2026, 4, 29, 12, 2).timestamp() * 1000
+            )
+            refreshed_neighbor = make_item("other-day", 2, "其他日期新内容", 3)
+            refreshed_neighbor["time_stamp"] = other_day["time_stamp"]
+            fresh_target = make_item("fresh-target", 3, "新目标日内容", 2)
+            stale_neighbor = make_item("stale-neighbor", 4, "窗口内旧内容", 2)
+            stale_neighbor["time_stamp"] = int(
+                datetime(2026, 4, 29, 12, 4).timestamp() * 1000
+            )
+            moved_old_target = make_item("moved-old-target", 5, "窗口外同日内容", 2)
+            moved_old_target["update_time"] = int(
+                datetime(2026, 4, 28, 12, 5).timestamp() * 1000
+            )
+            scrape_path.write_text(json.dumps({
+                "data": {"album-1": {
+                    "supplier": "南在南方",
+                    "items": [
+                        stale_target, other_day, stale_neighbor, moved_old_target
+                    ],
+                }}
+            }))
+            anchor_path.write_text(json.dumps({
+                "supplier": "南在南方",
+                "albumId": "album-1",
+                "items": [fresh_target, refreshed_neighbor],
+                "anchor": {
+                    "date": "2026-04-30",
+                    "dateWindow": True,
+                    "fullScan": False,
+                },
+            }))
+
+            self.assertTrue(
+                pick_products._merge_anchor_into_scrape(
+                    scrape_path, anchor_path
+                )
+            )
+            merged = json.loads(scrape_path.read_text())
+            items = merged["data"]["album-1"]["items"]
+
+        self.assertEqual(
+            {"fresh-target", "other-day", "moved-old-target"},
+            {item["goods_id"] for item in items},
+        )
+        neighbor = next(item for item in items if item["goods_id"] == "other-day")
+        self.assertEqual("其他日期新内容", neighbor["title"])
+
     def test_date_anchor_reports_empty_capture_details(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scrape_anchor.json"
@@ -162,7 +258,8 @@ class AnchorTests(unittest.TestCase):
                 "items": [],
                 "anchor": {
                     "date": "2026-07-17", "rawCount": 80,
-                    "pages": 4, "stopReason": "end", "fullScan": True,
+                    "pages": 4, "stopReason": "end", "dateWindow": True,
+                    "incomplete": False,
                 },
             }))
 
@@ -186,7 +283,7 @@ class AnchorTests(unittest.TestCase):
                 "anchor": {
                     "date": "2026-07-17", "rawCount": 20,
                     "pages": 1, "incomplete": True, "stopReason": "network",
-                    "fullScan": True,
+                    "dateWindow": True,
                 },
             }))
 
@@ -196,6 +293,28 @@ class AnchorTests(unittest.TestCase):
 
         self.assertIn("深挖未完成", problem)
         self.assertIn("network", problem)
+
+    def test_date_anchor_rejects_missing_display_order_before_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scrape_anchor.json"
+            item = make_item("match", 1, "T10", 2)
+            path.write_text(json.dumps({
+                "albumId": "album-1",
+                "items": [item],
+                "anchor": {
+                    "date": "2026-04-30",
+                    "pages": 3,
+                    "incomplete": False,
+                    "stopReason": "date-boundary",
+                    "dateWindow": True,
+                },
+            }))
+
+            problem = pick_products._date_anchor_problem(
+                path, "album-1", "2026-04-30"
+            )
+
+        self.assertIn("缺少 update_time", problem)
 
     def test_date_anchor_rejects_old_bookmark_capture(self):
         with tempfile.TemporaryDirectory() as tmp:

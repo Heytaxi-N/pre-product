@@ -58,6 +58,10 @@ class CodeModeTests(unittest.TestCase):
     def test_code_mode_rejects_regular_scrape_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
+            downloads = tmp_path / "Downloads"
+            downloads.mkdir()
+            old_diagnostic = downloads / "scrape_anchor.json"
+            old_diagnostic.write_text('{"old": true}')
             regular_scrape = tmp_path / "scrape_all.json"
             regular_scrape.write_text("{}")
             clock = iter((100, 100, 100, 102))
@@ -65,6 +69,7 @@ class CodeModeTests(unittest.TestCase):
             with patch.object(pick_products, "_data_has_code", side_effect=(False, True)) as has_code, \
                     patch.object(pick_products, "pick_newest_download",
                                  side_effect=lambda base: regular_scrape if base == "scrape_all" else None), \
+                    patch.object(Path, "home", return_value=tmp_path), \
                     patch.object(pick_products.time, "time", side_effect=lambda: next(clock)), \
                     patch.object(pick_products.time, "sleep"), \
                     patch("webbrowser.open"):
@@ -73,9 +78,11 @@ class CodeModeTests(unittest.TestCase):
                     {"suppliers": {"晨星外贸06": "album-1"}},
                     "晨星外贸06", "", timeout=1, code="0722b", force_fetch=True,
                 )
+            diagnostic_preserved = old_diagnostic.exists()
 
         self.assertFalse(result)
         self.assertEqual(1, has_code.call_count)
+        self.assertTrue(diagnostic_preserved)
 
     def test_preview_embeds_video_first_frame_and_hover_player(self):
         with tempfile.TemporaryDirectory() as tmp:
