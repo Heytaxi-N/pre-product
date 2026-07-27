@@ -262,6 +262,85 @@ class BatchExecutionTests(unittest.TestCase):
             calls,
         )
 
+    def test_anchor_batch_reuses_successful_fetch_for_same_supplier_and_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            scrape_path = root / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"A外贸": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", progress_path), \
+                    patch.object(
+                        pick_products, "ensure_data_for_date", return_value=True
+                    ) as ensure, \
+                    patch.object(pick_products, "load_scrape", return_value={}), \
+                    patch.object(
+                        pick_products, "cmd_anchor", return_value=1
+                    ) as command, \
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "pick_products.py", "anchor",
+                            "A外贸", "348包邮", "07-23",
+                            "A外贸", "248包邮", "07-23",
+                        ],
+                    ), \
+                    patch.dict(
+                        os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False
+                    ), \
+                    redirect_stdout(StringIO()) as output:
+                pick_products.main()
+
+        ensure.assert_called_once()
+        self.assertEqual(2, command.call_count)
+        self.assertIn("复用已深挖数据", output.getvalue())
+
+    def test_anchor_batch_does_not_cache_a_failed_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            scrape_path = root / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"A外贸": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", progress_path), \
+                    patch.object(
+                        pick_products,
+                        "ensure_data_for_date",
+                        side_effect=[False, True],
+                    ) as ensure, \
+                    patch.object(pick_products, "load_scrape", return_value={}), \
+                    patch.object(
+                        pick_products, "cmd_anchor", return_value=1
+                    ) as command, \
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "pick_products.py", "anchor",
+                            "A外贸", "348包邮", "07-23",
+                            "A外贸", "248包邮", "07-23",
+                        ],
+                    ), \
+                    patch.dict(
+                        os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False
+                    ), \
+                    redirect_stdout(StringIO()):
+                pick_products.main()
+
+        self.assertEqual(2, ensure.call_count)
+        command.assert_called_once()
+
     def test_range_batch_runs_quartets_in_input_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -315,6 +394,85 @@ class BatchExecutionTests(unittest.TestCase):
             ],
             calls,
         )
+
+    def test_range_batch_reuses_successful_fetch_for_same_supplier_and_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            scrape_path = root / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"晓豪": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", progress_path), \
+                    patch.object(
+                        pick_products, "ensure_data_for_range", return_value=True
+                    ) as ensure, \
+                    patch.object(pick_products, "load_scrape", return_value={}), \
+                    patch.object(
+                        pick_products, "cmd_title_range", return_value=1
+                    ) as command, \
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "pick_products.py", "range",
+                            "晓豪", "07-17", "T10", "26版",
+                            "晓豪", "07-17", "T11", "27版",
+                        ],
+                    ), \
+                    patch.dict(
+                        os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False
+                    ), \
+                    redirect_stdout(StringIO()) as output:
+                pick_products.main()
+
+        ensure.assert_called_once()
+        self.assertEqual(2, command.call_count)
+        self.assertIn("复用已深挖数据", output.getvalue())
+
+    def test_range_batch_does_not_cache_a_failed_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            scrape_path = root / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"晓豪": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", progress_path), \
+                    patch.object(
+                        pick_products,
+                        "ensure_data_for_range",
+                        side_effect=[False, True],
+                    ) as ensure, \
+                    patch.object(pick_products, "load_scrape", return_value={}), \
+                    patch.object(
+                        pick_products, "cmd_title_range", return_value=1
+                    ) as command, \
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "pick_products.py", "range",
+                            "晓豪", "07-17", "T10", "26版",
+                            "晓豪", "07-17", "T11", "27版",
+                        ],
+                    ), \
+                    patch.dict(
+                        os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False
+                    ), \
+                    redirect_stdout(StringIO()):
+                pick_products.main()
+
+        self.assertEqual(2, ensure.call_count)
+        command.assert_called_once()
 
 
 class BatchPreviewTests(unittest.TestCase):

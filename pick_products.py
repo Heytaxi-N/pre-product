@@ -2086,15 +2086,24 @@ def main():
         scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
         is_batch = len(targets) > 1
         results = []
+        fetched_dates = set()
         for index, (target_supplier, target_date, start_prefix, end_prefix) in enumerate(targets, 1):
             norm_date = _normalize_date(target_date)
+            canonical_name, album_id = _resolve_supplier(config, target_supplier)
+            fetch_key = (album_id or target_supplier, norm_date)
             label = (
                 f"{target_supplier} · 首尾 {start_prefix} → {end_prefix} · {norm_date}"
             )
             review_label = f"第 {index}/{len(targets)} 项 · {label}"
             print(f"\n[{index}/{len(targets)}] {label}")
             try:
-                if is_batch:
+                if fetch_key in fetched_dates:
+                    print(
+                        f"  ↻ 复用已深挖数据: "
+                        f"{canonical_name or target_supplier} {norm_date}"
+                    )
+                    ready = True
+                elif is_batch:
                     ready = ensure_data_for_range(
                         scrape_path, config, target_supplier, norm_date,
                         start_prefix, end_prefix, raise_interrupt=True,
@@ -2110,6 +2119,7 @@ def main():
                         "label": label, "count": 0, "reason": "深挖失败",
                     })
                     continue
+                fetched_dates.add(fetch_key)
                 data = load_scrape(scrape_path, config)
                 kwargs = {}
                 if is_batch:
@@ -2151,13 +2161,22 @@ def main():
         scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
         is_batch = len(targets) > 1
         results = []
+        fetched_dates = set()
         for index, (target_supplier, keyword, target_date) in enumerate(targets, 1):
             norm_date = _normalize_date(target_date)
+            canonical_name, album_id = _resolve_supplier(config, target_supplier)
+            fetch_key = (album_id or target_supplier, norm_date)
             label = f"{target_supplier} · 锚点 {keyword} · {norm_date}"
             review_label = f"第 {index}/{len(targets)} 项 · {label}"
             print(f"\n[{index}/{len(targets)}] {label}")
             try:
-                if is_batch:
+                if fetch_key in fetched_dates:
+                    print(
+                        f"  ↻ 复用已深挖数据: "
+                        f"{canonical_name or target_supplier} {norm_date}"
+                    )
+                    ready = True
+                elif is_batch:
                     ready = ensure_data_for_date(
                         scrape_path, config, target_supplier, norm_date,
                         raise_interrupt=True,
@@ -2172,6 +2191,7 @@ def main():
                         "label": label, "count": 0, "reason": "深挖失败",
                     })
                     continue
+                fetched_dates.add(fetch_key)
                 data = load_scrape(scrape_path, config)
                 kwargs = {}
                 if is_batch:
