@@ -75,6 +75,23 @@ class TitleRangeTests(unittest.TestCase):
         self.assertEqual("", problem)
         self.assertEqual(["start", "end"], [item["goods_id"] for item in group])
 
+    def test_title_range_ignores_prefix_whitespace_and_ascii_case(self):
+        items = [
+            make_item("start", "🔥 On昂跑年中特价", 1, 1),
+            make_item("middle", "商品细节", 2, 2),
+            make_item("end", "⚠️试穿偏小半码", 3, 3),
+        ]
+
+        group, problem = pick_products.find_title_range(
+            items, "🔥on", "⚠️试穿偏小", "2026-07-17"
+        )
+
+        self.assertEqual("", problem)
+        self.assertEqual(
+            ["start", "middle", "end"],
+            [item["goods_id"] for item in group],
+        )
+
     def test_range_anchor_requires_date_scan_and_matching_prefixes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scrape_anchor.json"

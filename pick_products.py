@@ -584,6 +584,12 @@ def _item_display_date(it):
     """页面日期按发布时间计算."""
     return _item_date(it)
 
+
+def _normalize_title_prefix(value):
+    """标题前缀匹配忽略空白和英文大小写, 原始文案保持不变."""
+    return re.sub(r"\s+", "", value or "").casefold()
+
+
 def find_title_range(items, start_prefix, end_prefix, date_str):
     """在指定发布日期内, 按页面编排顺序返回两个标题前缀之间的帖子."""
     ordered = sorted(
@@ -593,9 +599,10 @@ def find_title_range(items, start_prefix, end_prefix, date_str):
     prefixes = (("起始", start_prefix.strip()), ("结束", end_prefix.strip()))
     matched = []
     for label, prefix in prefixes:
+        normalized_prefix = _normalize_title_prefix(prefix)
         indices = [
             i for i, it in enumerate(ordered)
-            if (it.get("title") or "").strip().startswith(prefix)
+            if _normalize_title_prefix(it.get("title")).startswith(normalized_prefix)
         ]
         if len(indices) != 1:
             return [], f"{label}前缀「{prefix}」匹配到 {len(indices)} 条, 请提供更多标题字"
@@ -1879,7 +1886,7 @@ if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
   let aid=null,name=anchorSup;
   for(const [n,a] of Object.entries(SUP)){if(n===anchorSup||n.includes(anchorSup)){aid=a;name=n;break;}}
   if(!aid){alert('未找到供货商: '+anchorSup);return;}
-  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,missesAfterDate=0,foundRangeDate=false,missesAfterRangeDate=0,stopReason='end';const MAX=50;const RANGE_MAX=10;const pageLimit=rangeDate?RANGE_MAX:MAX;
+  const all=[];let pageTs='',pages=0,rawCount=0,hasMore=false,incomplete=false,foundCode=false,missesAfterCode=0,foundDate=false,missesAfterDate=0,foundRangeDate=false,missesAfterRangeDate=0,stopReason='end';const MAX=50;const RANGE_MAX=50;const pageLimit=rangeDate?RANGE_MAX:MAX;
   while(pages<pageLimit){
     let d;try{d=await fetchOne(aid,pageTs);}catch(e){incomplete=true;stopReason='network';break;}
     const rawItems=d.result&&d.result.items?d.result.items:[];

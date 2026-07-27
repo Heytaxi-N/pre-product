@@ -82,7 +82,8 @@ class BookmarkletTests(unittest.TestCase):
                     body,
                 )
                 self.assertIn("const MAX=50", body)
-                self.assertIn("const RANGE_MAX=10", body)
+                self.assertIn("const RANGE_MAX=50", body)
+                self.assertNotIn("const RANGE_MAX=10", body)
                 self.assertIn("const pageLimit=rangeDate?RANGE_MAX:MAX", body)
                 self.assertIn("if(rawItems.length===0)break", body)
                 self.assertNotIn("if(items.length===0)break", body)
