@@ -182,6 +182,39 @@ class DailyReliabilityTests(unittest.TestCase):
         create_folder.assert_not_called()
         save.assert_not_called()
 
+    def test_unconfirmed_preview_does_not_create_folder_or_advance_progress(self):
+        item = make_item("unconfirmed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def download(_group, tmp_dir):
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                image = tmp_dir / "image.jpg"
+                image.write_bytes(b"image")
+                return [image]
+
+            with patch.object(pick_products, "TMP_ROOT", root / "tmp"), \
+                    patch.object(
+                        pick_products, "download_product_images", side_effect=download
+                    ), \
+                    patch.object(
+                        pick_products, "classify_images_ai", return_value=None
+                    ), \
+                    patch.object(
+                        pick_products, "wait_for_classify_review", return_value=None
+                    ), \
+                    patch.object(
+                        pick_products, "create_product_folder"
+                    ) as create_folder:
+                count = pick_products.process_groups(
+                    "supplier", "album-1", [[item]], {}, None, {}, {}, review=True
+                )
+
+            self.assertEqual(0, count)
+            create_folder.assert_not_called()
+            self.assertFalse(any((root / "tmp").iterdir()))
+
     def test_feishu_failure_does_not_create_folder_or_advance_progress(self):
         item = make_item("feishu-failed")
 

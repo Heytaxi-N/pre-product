@@ -112,6 +112,31 @@ class CodeModeTests(unittest.TestCase):
             self.assertIn("c.draggable=false", html)
             self.assertNotIn("mediaEl.addEventListener('mouseenter'", html)
 
+    def test_classify_preview_supports_multi_select_and_group_drag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "image.jpg"
+            image.write_bytes(b"image")
+            output = root / "preview.html"
+            prepared = [{
+                "gi": 1,
+                "latest_time": "2026-07-15 12:00",
+                "sorted_imgs": [
+                    (image, "其他", 0, ""),
+                    (image, "其他", 0, ""),
+                    (image, "其他", 0, ""),
+                ],
+            }]
+
+            pick_products.build_classify_preview_html("测试供货商", prepared, output)
+            html = output.read_text()
+
+        self.assertIn("按住 Command 单击", html)
+        self.assertIn("e.metaKey||e.ctrlKey", html)
+        self.assertIn("function selectRange", html)
+        self.assertIn("dragEls=[...cards.children]", html)
+        self.assertIn("dragEls.forEach(card=>fragment.appendChild(card))", html)
+
     def test_code_matches_are_one_ordered_product_with_review(self):
         newer = make_item("newer", 2)
         older = make_item("older", 1)
@@ -157,7 +182,7 @@ class CodeModeTests(unittest.TestCase):
 
             def fake_preview(_supplier, prepared):
                 captured["preview"] = prepared[0]["sorted_imgs"]
-                return None
+                return [{"order": [0, 1], "sizes": []}]
 
             def fake_create(final, *_args):
                 captured["final"] = final

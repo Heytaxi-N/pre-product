@@ -716,6 +716,7 @@ h2{margin:0;font-size:16px}
 .cards{display:flex;flex-wrap:wrap;gap:10px;padding:12px;min-height:80px}
 .card{width:130px;position:relative;border:2px solid transparent;border-radius:10px}
 .card.sz{border-color:#ff9500}
+.card.selected{border-color:#0071e3!important;box-shadow:0 0 0 2px rgba(0,113,227,.2)}
 .card .media{width:130px;height:130px;border-radius:8px;background:#eee;display:block;object-fit:cover;cursor:grab;overflow:hidden}
 .card .vid{position:relative}
 .card .vid img,.card .vid video{width:100%;height:100%;display:block;object-fit:cover}
@@ -735,7 +736,7 @@ h2{margin:0;font-size:16px}
 #hover-preview img,#hover-preview video{display:block;max-width:100%;max-height:100%;object-fit:contain}
 </style></head><body>
 <header><h2 id="preview-title">🖼️ 排序预览 — 拖动排序 · × 删图</h2><button id="confirm">✅ 完成并生成</button></header>
-<div class="hint">图片按当前处理顺序展示。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br>某张是<b>尺码表</b>但没识别出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
+<div class="hint">图片按当前处理顺序展示。<b>拖动</b>调顺序,点 <b>×</b> 删掉不要的(不会存到本地)。<br><b>按住 Command 单击</b>可多选,选中一张后按 <b>Shift 单击</b>可连选,选中后可一起拖动。某张是<b>尺码表</b>但没识别出→点它下面的「尺码表」按钮标上(橙框=已标,会命名成"尺码表"); 视频显示为 🎬。改完点右上「完成并生成」。直接关网页=按现在顺序生成。</div>
 <div id="app"></div>
 <div id="hover-preview" aria-hidden="true"></div>
 <script>
@@ -744,8 +745,16 @@ const app=document.getElementById('app');
 const hoverPreview=document.getElementById('hover-preview');
 document.title=D.label+' · 排序预览';
 document.getElementById('preview-title').textContent='🖼️ '+D.label+' — 拖动排序 · × 删图';
-let dragEl=null;
+let dragEl=null,dragEls=[],selected=new Set(),selectionAnchor=null;
 function renumber(box){[...box.children].forEach((c,i)=>{const n=c.querySelector('.num');if(n)n.textContent=i+1;});}
+function clearSelection(){selected.forEach(c=>c.classList.remove('selected'));selected.clear();selectionAnchor=null;}
+function selectCard(c){selected.add(c);c.classList.add('selected');selectionAnchor=c;}
+function selectRange(c){
+  if(!selectionAnchor||selectionAnchor.parentNode!==c.parentNode){clearSelection();selectCard(c);return;}
+  const cards=[...c.parentNode.children],a=cards.indexOf(selectionAnchor),b=cards.indexOf(c),lo=Math.min(a,b),hi=Math.max(a,b);
+  cards.slice(lo,hi+1).forEach(selectCard);
+  selectionAnchor=c;
+}
 function hidePreview(){
   const video=hoverPreview.querySelector('video');if(video)video.pause();
   hoverPreview.replaceChildren();hoverPreview.style.display='none';
@@ -771,7 +780,18 @@ D.prods.forEach(pr=>{
     const videoThumb=im.thumb?'<img draggable="false" src="'+im.thumb+'">':'<video muted preload="metadata" src="'+im.src+'"></video>';
     const media=im.video?'<div class="media vid">'+videoThumb+'<span class="play">▶</span></div>':'<img class="media" draggable="false" src="'+im.thumb+'">';
     c.innerHTML='<span class="num"></span><button class="del">×</button>'+media+'<button class="preview-btn" title="预览" aria-label="预览"></button><div class="cat">'+im.cat+'</div><button class="szbtn">尺码表</button>';
-    c.querySelector('.del').onclick=()=>{c.remove();renumber(cards);};
+    c.addEventListener('click',e=>{
+      if(e.target.closest('button'))return;
+      const range=e.shiftKey,add=e.metaKey||e.ctrlKey;
+      if(range){
+        selectRange(c);
+      }else if(add){
+        if(selected.has(c)){selected.delete(c);c.classList.remove('selected');}
+        else selectCard(c);
+        selectionAnchor=c;
+      }else{clearSelection();selectCard(c);}
+    });
+    c.querySelector('.del').onclick=()=>{selected.delete(c);if(selectionAnchor===c)selectionAnchor=null;c.remove();renumber(cards);};
     c.querySelector('.szbtn').onclick=()=>{c.classList.toggle('sz');};
     const previewBtn=c.querySelector('.preview-btn');
     const showFromButton=()=>{c.draggable=false;showPreview(im,previewBtn);};
@@ -782,8 +802,14 @@ D.prods.forEach(pr=>{
     previewBtn.addEventListener('focus',showFromButton);
     previewBtn.addEventListener('blur',hideFromButton);
     previewBtn.onmousedown=e=>e.stopPropagation();
-    c.addEventListener('dragstart',e=>{hidePreview();dragEl=c;c.classList.add('drag');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','');});
-    c.addEventListener('dragend',()=>{c.classList.remove('drag');dragEl=null;renumber(cards);});
+    c.addEventListener('dragstart',e=>{
+      hidePreview();
+      if(!selected.has(c)){clearSelection();selectCard(c);}
+      dragEl=c;dragEls=[...cards.children].filter(card=>selected.has(card));
+      dragEls.forEach(card=>card.classList.add('drag'));
+      e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','');
+    });
+    c.addEventListener('dragend',()=>{dragEls.forEach(card=>card.classList.remove('drag'));dragEl=null;dragEls=[];renumber(cards);});
     cards.appendChild(c);
   });
   // 容器级 dragover: 先锁定光标所在行(y 落在卡片上下范围内), 行内按 x 找插入点;
@@ -803,7 +829,11 @@ D.prods.forEach(pr=>{
       if(d<bd){bd=d;best=el;after=e.clientX>cx;}
     }
     const ref=best?(after?best.nextSibling:best):null;
-    if(ref!==dragEl&&ref!==dragEl.nextSibling)cards.insertBefore(dragEl,ref);
+    if(ref&&!dragEls.includes(ref)){
+      const fragment=document.createDocumentFragment();dragEls.forEach(card=>fragment.appendChild(card));cards.insertBefore(fragment,ref);
+    }else if(!ref){
+      const fragment=document.createDocumentFragment();dragEls.forEach(card=>fragment.appendChild(card));cards.appendChild(fragment);
+    }
     renumber(cards);
   });
   box.appendChild(cards);app.appendChild(box);renumber(cards);
@@ -839,7 +869,7 @@ def _open_in_browser(path):
 
 
 def wait_for_classify_review(
-        supplier_name, prepared, timeout=600, review_id="", review_label="",
+        supplier_name, prepared, timeout=None, review_id="", review_label="",
         raise_interrupt=False):
     """弹排序预览, 等 分类确认.json。返回 orders(按 prepared 顺序的存活id列表)或 None。"""
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", review_id).strip("_")
@@ -856,12 +886,13 @@ def wait_for_classify_review(
         except Exception: pass
     _open_in_browser(out)
     print(f"\n🖼️  已弹出排序预览(自动打开): {out}")
-    print(f"   拖动排序 / × 删图 → 点「完成并生成」(最长 {timeout} 秒)")
-    print(f"   直接关掉网页 = 按当前预览顺序生成")
+    wait_hint = f"最长 {timeout} 秒" if timeout is not None else "一直等待"
+    print(f"   拖动排序 / × 删图 → 点「完成并生成」({wait_hint}, Ctrl+C 取消)")
+    print(f"   未点「完成并生成」不会生成文件夹")
     start = time.time() - 1
-    end = time.time() + timeout
+    end = time.time() + timeout if timeout is not None else None
     try:
-        while time.time() < end:
+        while end is None or time.time() < end:
             time.sleep(1)
             p = pick_newest_download(confirm_base)
             if p and p.stat().st_mtime > start:
@@ -879,8 +910,8 @@ def wait_for_classify_review(
     except KeyboardInterrupt:
         if raise_interrupt:
             raise
-        print("\n  已跳过, 按当前顺序")
-    print("  超时, 按当前顺序")
+        print("\n  已取消, 未收到排序确认")
+    print("  未收到排序确认, 本次不生成文件夹")
     return None
 
 
@@ -951,25 +982,30 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
             )
         else:
             edits = wait_for_classify_review(supplier_name, prepared)
-        if edits:
-            for pr, ed in zip(prepared, edits):
-                si = pr["sorted_imgs"]
-                sizes = set(ed.get("sizes", []))
-                final = []
-                for i in ed.get("order", []):
-                    if not (0 <= i < len(si)):
-                        continue
-                    path, cat, score, color = si[i]
-                    is_vid = cat == "视频" or path.suffix.lower() in VIDEO_EXTS
-                    # 命名只认 尺码表/视频; 标记优先, 取消标记的旧尺码表回落成普通图
-                    if i in sizes:
-                        cat = "尺码表"
-                    elif is_vid:
-                        cat = "视频"
-                    elif cat == "尺码表":
-                        cat = "细节图"
-                    final.append((path, cat, score, color))
-                pr["final"] = final
+        if edits is None:
+            print("  未收到人工排序确认, 不生成任何产品文件夹")
+            for pr in prepared:
+                if pr["tmp_dir"].exists():
+                    shutil.rmtree(pr["tmp_dir"], ignore_errors=True)
+            return 0
+        for pr, ed in zip(prepared, edits):
+            si = pr["sorted_imgs"]
+            sizes = set(ed.get("sizes", []))
+            final = []
+            for i in ed.get("order", []):
+                if not (0 <= i < len(si)):
+                    continue
+                path, cat, score, color = si[i]
+                is_vid = cat == "视频" or path.suffix.lower() in VIDEO_EXTS
+                # 命名只认 尺码表/视频; 标记优先, 取消标记的旧尺码表回落成普通图
+                if i in sizes:
+                    cat = "尺码表"
+                elif is_vid:
+                    cat = "视频"
+                elif cat == "尺码表":
+                    cat = "细节图"
+                final.append((path, cat, score, color))
+            pr["final"] = final
 
     # Phase B: 飞书 → 建文件夹
     n = 0
