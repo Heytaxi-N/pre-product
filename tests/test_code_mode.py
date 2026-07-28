@@ -136,6 +136,8 @@ class CodeModeTests(unittest.TestCase):
         self.assertIn("function selectRange", html)
         self.assertIn("dragEls=[...cards.children]", html)
         self.assertIn("dragEls.forEach(card=>fragment.appendChild(card))", html)
+        self.assertIn("selected.has(c)?[...selected]:[c]", html)
+        self.assertIn("boxes.forEach(renumber)", html)
 
     def test_code_matches_are_one_ordered_product_with_review(self):
         newer = make_item("newer", 2)

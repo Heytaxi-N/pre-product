@@ -791,7 +791,11 @@ D.prods.forEach(pr=>{
         selectionAnchor=c;
       }else{clearSelection();selectCard(c);}
     });
-    c.querySelector('.del').onclick=()=>{selected.delete(c);if(selectionAnchor===c)selectionAnchor=null;c.remove();renumber(cards);};
+    c.querySelector('.del').onclick=()=>{
+      const targets=selected.has(c)?[...selected]:[c],boxes=new Set(targets.map(card=>card.parentNode));
+      targets.forEach(card=>{selected.delete(card);if(selectionAnchor===card)selectionAnchor=null;card.remove();});
+      boxes.forEach(renumber);
+    };
     c.querySelector('.szbtn').onclick=()=>{c.classList.toggle('sz');};
     const previewBtn=c.querySelector('.preview-btn');
     const showFromButton=()=>{c.draggable=false;showPreview(im,previewBtn);};
