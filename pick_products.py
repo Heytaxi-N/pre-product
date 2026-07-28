@@ -722,7 +722,7 @@ h2{margin:0;font-size:16px}
 .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34px;height:34px;border-radius:50%;background:rgba(0,0,0,.58);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;padding-left:2px;box-sizing:border-box}
 .card.drag{opacity:.35}
 .num{position:absolute;top:5px;left:5px;background:#0071e3;color:#fff;font-size:11px;border-radius:10px;padding:1px 7px;font-weight:600}
-.del{position:absolute;top:4px;right:4px;width:22px;height:22px;border:0;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;line-height:22px;padding:0;cursor:pointer}
+.del{position:absolute;top:4px;right:4px;z-index:3;width:22px;height:22px;border:0;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;line-height:22px;padding:0;cursor:pointer}
 .del:hover{background:#d32f2f}
 .preview-btn{position:absolute;right:5px;top:101px;z-index:2;width:24px;height:24px;border:0;border-radius:50%;background:rgba(0,0,0,.58);cursor:pointer}
 .preview-btn:hover{background:#0071e3}
@@ -1291,13 +1291,32 @@ def cmd_preview(config, progress, data, code=""):
 
 
 def _normalize_date(date_str):
-    """各种简写 → 'YYYY-MM-DD'. 支持 MM-DD / MMDD / YYYY-MM-DD / YYYYMMDD, MM-DD 补当前年份."""
-    digits = date_str.strip().replace("-", "")
-    if len(digits) == 4:  # MMDD / MM-DD
-        return f"{datetime.now():%Y}-{digits[:2]}-{digits[2:]}"
-    if len(digits) == 8:  # YYYYMMDD / YYYY-MM-DD
-        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
-    return date_str.strip()  # 无法识别, 原样返回
+    """各种简写 → 'YYYY-MM-DD'; 月日允许不补零, 短日期补当前年份."""
+    value = str(date_str).strip()
+    separated = re.fullmatch(
+        r"(?:(?P<year>\d{4})-)?(?P<month>\d{1,2})-(?P<day>\d{1,2})",
+        value,
+    )
+    compact = re.fullmatch(r"\d{4}|\d{8}", value)
+    if separated:
+        year = int(separated.group("year") or datetime.now().year)
+        month = int(separated.group("month"))
+        day = int(separated.group("day"))
+    elif compact and len(value) == 4:
+        year = datetime.now().year
+        month, day = int(value[:2]), int(value[2:])
+    elif compact:
+        year, month, day = int(value[:4]), int(value[4:6]), int(value[6:])
+    else:
+        raise ValueError(
+            f"日期格式无效「{value}」, 请使用 7-21、07-21 或 2026-07-21"
+        )
+    try:
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except ValueError:
+        raise ValueError(
+            f"日期格式无效「{value}」, 请检查年月日是否存在"
+        )
 
 def _data_has_date(scrape_path, config, supplier_name, date_str, require_order=True):
     """检查 scrape 里是否有目标发布日期, 默认同时要求页面排序字段."""
@@ -2095,7 +2114,18 @@ def main():
         results = []
         fetched_dates = set()
         for index, (target_supplier, target_date, start_prefix, end_prefix) in enumerate(targets, 1):
-            norm_date = _normalize_date(target_date)
+            try:
+                norm_date = _normalize_date(target_date)
+            except ValueError as e:
+                label = (
+                    f"{target_supplier} · 首尾 {start_prefix} → {end_prefix} "
+                    f"· {target_date}"
+                )
+                print(f"\n[{index}/{len(targets)}] {label}\n❌ {e}")
+                results.append({
+                    "label": label, "count": 0, "reason": "日期格式无效",
+                })
+                continue
             canonical_name, album_id = _resolve_supplier(config, target_supplier)
             fetch_key = (album_id or target_supplier, norm_date)
             label = (
@@ -2170,7 +2200,15 @@ def main():
         results = []
         fetched_dates = set()
         for index, (target_supplier, keyword, target_date) in enumerate(targets, 1):
-            norm_date = _normalize_date(target_date)
+            try:
+                norm_date = _normalize_date(target_date)
+            except ValueError as e:
+                label = f"{target_supplier} · 锚点 {keyword} · {target_date}"
+                print(f"\n[{index}/{len(targets)}] {label}\n❌ {e}")
+                results.append({
+                    "label": label, "count": 0, "reason": "日期格式无效",
+                })
+                continue
             canonical_name, album_id = _resolve_supplier(config, target_supplier)
             fetch_key = (album_id or target_supplier, norm_date)
             label = f"{target_supplier} · 锚点 {keyword} · {norm_date}"
@@ -2209,7 +2247,7 @@ def main():
                     }
                 count = cmd_anchor(
                     config, progress, data, target_supplier, keyword,
-                    target_date, **kwargs,
+                    norm_date, **kwargs,
                 ) or 0
                 results.append({
                     "label": label, "count": count,

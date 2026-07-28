@@ -63,6 +63,80 @@ class BatchTargetParsingTests(unittest.TestCase):
 
 
 class BatchExecutionTests(unittest.TestCase):
+    def test_anchor_invalid_date_skips_only_that_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            scrape_path = root / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"苏子熙上图号": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", progress_path), \
+                    patch.object(
+                        pick_products, "ensure_data_for_date", return_value=True
+                    ) as ensure, \
+                    patch.object(pick_products, "load_scrape", return_value={}), \
+                    patch.object(
+                        pick_products, "cmd_anchor", return_value=1
+                    ) as command, \
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "pick_products.py", "anchor",
+                            "苏子熙上图号", "无效条件", "2026-02-30",
+                            "苏子熙上图号", "有效条件", "7-21",
+                        ],
+                    ), \
+                    patch.dict(
+                        os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False
+                    ), \
+                    redirect_stdout(StringIO()) as output:
+                pick_products.main()
+
+        ensure.assert_called_once()
+        command.assert_called_once()
+        self.assertEqual("2026-07-21", command.call_args.args[5])
+        self.assertIn("日期格式无效", output.getvalue())
+        self.assertIn("成功 1 项", output.getvalue())
+
+    def test_range_invalid_date_stops_before_deep_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            scrape_path = root / "scrape_all.json"
+            config_path.write_text(json.dumps({
+                "suppliers": {"苏子熙上图号": "album-1"}
+            }))
+            scrape_path.write_text(json.dumps({"data": {}}))
+
+            with patch.object(pick_products, "CONFIG_FILE", config_path), \
+                    patch.object(pick_products, "PROGRESS_FILE", progress_path), \
+                    patch.object(
+                        pick_products, "ensure_data_for_range"
+                    ) as ensure, \
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "pick_products.py", "range",
+                            "苏子熙上图号", "2026-02-30", "起始", "结束",
+                        ],
+                    ), \
+                    patch.dict(
+                        os.environ, {"SCRAPE_JSON": str(scrape_path)}, clear=False
+                    ), \
+                    redirect_stdout(StringIO()) as output:
+                pick_products.main()
+
+        ensure.assert_not_called()
+        self.assertIn("日期格式无效", output.getvalue())
+
     def test_run_keyboard_interrupt_stops_the_entire_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -251,11 +325,11 @@ class BatchExecutionTests(unittest.TestCase):
         self.assertEqual(
             [
                 (
-                    "南在南方", "凯乐石女款裙裤", "04-30", "01",
+                    "南在南方", "凯乐石女款裙裤", "2026-04-30", "01",
                     "第 1/2 项 · 南在南方 · 锚点 凯乐石女款裙裤 · 2026-04-30",
                 ),
                 (
-                    "晓豪", "宽松透气", "07-10", "02",
+                    "晓豪", "宽松透气", "2026-07-10", "02",
                     "第 2/2 项 · 晓豪 · 锚点 宽松透气 · 2026-07-10",
                 ),
             ],
@@ -603,6 +677,7 @@ class BatchPreviewTests(unittest.TestCase):
         self.assertIn('"confirmName": "分类确认_01_01.json"', html)
         self.assertIn("document.title=D.label+' · 排序预览'", html)
         self.assertIn("a.download=D.confirmName", html)
+        self.assertRegex(html, r"\.del\{[^}]*z-index:[1-9]")
 
     def test_preview_html_escapes_script_closing_text_in_batch_label(self):
         with tempfile.TemporaryDirectory() as tmp:

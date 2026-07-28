@@ -28,6 +28,31 @@ def make_item(goods_id, title, publish_minute, update_minute, publish_day=17):
 
 
 class TitleRangeTests(unittest.TestCase):
+    def test_normalize_date_accepts_non_padded_month_and_day(self):
+        current_year = datetime.now().year
+
+        expected = {
+            "7-21": f"{current_year}-07-21",
+            "07-21": f"{current_year}-07-21",
+            "0721": f"{current_year}-07-21",
+            "2026-7-21": "2026-07-21",
+            "2026-07-21": "2026-07-21",
+            "20260721": "2026-07-21",
+        }
+        self.assertEqual(
+            expected,
+            {
+                value: pick_products._normalize_date(value)
+                for value in expected
+            },
+        )
+
+    def test_normalize_date_rejects_invalid_calendar_date(self):
+        for value in ("2026-02-30", "20260230"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "日期格式无效"):
+                    pick_products._normalize_date(value)
+
     def test_title_range_includes_both_ends_and_middle_in_display_order(self):
         items = [
             make_item("middle", "中间细节图", 2, 2),
