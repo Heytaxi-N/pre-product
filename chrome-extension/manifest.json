@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "微购相册自动抓取",
+  "version": "1.0.0",
+  "description": "打开微购相册上新页后自动抓取供应商上新数据",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.szwego.com/static/index.html*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://www.szwego.com/*"
+  ]
+}

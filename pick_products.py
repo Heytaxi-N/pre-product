@@ -18,6 +18,7 @@ OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
 TMP_ROOT = Path(tempfile.gettempdir()) / "weidian_pick"  # 临时/缓存, 不落在商品图里
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 config.json 里配 defaults.max_products
 BOOKMARKLET_FILE = SCRIPT_DIR / "install_bookmark.html"
+CHROME_EXTENSION_DIR = SCRIPT_DIR / "chrome-extension"
 GROUP_TIME_GAP = 120  # 秒: 帖子时间间隔 < 此值归为同一产品
 
 
@@ -580,6 +581,17 @@ def _item_order(it):
     """页面编排顺序使用 update_time; 旧抓取数据回退到发布时间."""
     return it.get("update_time") or it["time_stamp"]
 
+
+def _workbench_datetime(it):
+    """工作台统一使用 update_time; 没有时回退 time_stamp."""
+    value = it.get("update_time") or it.get("time_stamp")
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            return datetime.fromtimestamp(float(value) / 1000)
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return datetime.fromtimestamp(float(it["time_stamp"]) / 1000)
+
 def _item_display_date(it):
     """页面日期按发布时间计算."""
     return _item_date(it)
@@ -1131,6 +1143,133 @@ def thumb(url):
     """图片 URL 加缩略参数, 预览加载更快."""
     return url.split("?")[0] + "?imageMogr2/thumbnail/!200x200r/quality/80"
 
+
+def _workbench_item(item):
+    """保留处理管线需要的原始条目, 另附工作台用的懒加载媒体缩略图."""
+    value = dict(item)
+    media = []
+    seen = set()
+    for url in item.get("imgsSrc") or []:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        path = url.split("?")[0].lower()
+        is_video = path.endswith(VIDEO_EXTS) and "vframe" not in url.lower()
+        media.append({
+            "url": url,
+            "type": "video" if is_video else "image",
+            "thumb": "" if is_video else thumb(url),
+        })
+    video = item.get("videoUrl") or item.get("videoURL") or ""
+    if video and video not in seen:
+        media.append({"url": video, "type": "video", "thumb": ""})
+    value["workbenchMedia"] = media
+    return value
+
+
+def _workbench_payload(data, progress):
+    """工作台数据: 新增内容与全部历史同时提供, 默认只展示新增内容."""
+    suppliers = []
+    for aid, bucket in data.items():
+        all_items = sorted(
+            bucket.get("items") or [],
+            key=_workbench_datetime,
+            reverse=True,
+        )
+        if not all_items:
+            continue
+        new_ids = {
+            item.get("goods_id")
+            for item in filter_new_items(aid, all_items, progress)
+        }
+        workbench_items = []
+        for item in all_items:
+            value = _workbench_item(item)
+            value["_new"] = item.get("goods_id") in new_ids
+            value["workbenchDate"] = _workbench_datetime(item).strftime("%m/%d")
+            value["workbenchTime"] = _workbench_datetime(item).strftime("%m/%d %H:%M")
+            workbench_items.append(value)
+        suppliers.append({
+            "supplier": bucket.get("supplier", aid[-8:]),
+            "albumId": aid,
+            "newCount": len(new_ids),
+            "items": workbench_items,
+        })
+    return suppliers
+
+
+def build_workbench_html(suppliers, out_path, capture_time=""):
+    """生成日常选品工作台, 输出格式复用 confirmed_groups.json."""
+    payload = json.dumps(suppliers, ensure_ascii=False).replace("</", "<\\/")
+    capture_payload = json.dumps(capture_time, ensure_ascii=False)
+    html = r'''<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>日常选品工作台</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1d1d1f;background:#f5f5f7}
+*{box-sizing:border-box}body{margin:0}.top{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid #e5e5ea;padding:12px 18px;box-shadow:0 2px 8px #0000000d}
+.topline{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.top h1{font-size:18px;margin:0 12px 0 0}.muted{color:#86868b;font-size:12px}.supplier-toggle{display:none}
+button{border:1px solid #d2d2d7;background:#fff;border-radius:8px;padding:7px 12px;cursor:pointer;color:#1d1d1f}button:hover{border-color:#0071e3;color:#0071e3}
+button.primary{background:#0071e3;color:#fff;border-color:#0071e3;font-weight:600}button.primary:disabled{opacity:.45;cursor:not-allowed}
+button.danger{color:#c62828}.switch{display:inline-flex;gap:6px;align-items:center;font-size:13px}.supplier-list{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;max-height:2000px;overflow:hidden;opacity:1}.top.collapsed .supplier-list{max-height:0;margin-top:0;opacity:0;pointer-events:none}.top.collapsed .supplier-toggle{display:inline-flex}
+.supplier-list label{display:inline-flex;align-items:center;gap:5px;background:#f5f5f7;border-radius:18px;padding:6px 10px;font-size:13px;cursor:pointer}.supplier-list label.active{background:#e8f2ff;color:#0066cc}
+.supplier-list small{color:#86868b}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;max-width:1500px;margin:0 auto;padding:14px}.timeline{min-width:0}.tabs{display:flex;gap:6px;overflow:auto;padding-bottom:8px}.tab{white-space:nowrap}.tab.active{border-color:#0071e3;color:#0071e3;background:#e8f2ff}
+.day{margin:14px 0}.day-title{position:sticky;top:94px;z-index:4;background:#f5f5f7;color:#555;padding:6px 2px;font-size:12px;font-weight:600}.entry{background:#fff;border:2px solid #e5e5ea;border-radius:12px;padding:10px;margin:8px 0}.entry.selected{border-color:#0071e3;background:#f5faff}.entry.locked{opacity:.45;background:#f0f0f2}.entry-head{display:flex;gap:10px;align-items:flex-start}.entry-info{min-width:180px;flex:1}.entry-time{font-size:12px;color:#86868b}.entry-title{font-size:13px;line-height:1.4;margin-top:4px;white-space:pre-wrap;max-height:54px;overflow:hidden}.entry-badge{font-size:11px;color:#86868b;white-space:nowrap}.media-strip{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.media{width:78px;height:78px;border-radius:8px;overflow:hidden;position:relative;background:#eee;border:2px solid transparent;padding:0}.media:hover{border-color:#0071e3}.media img{width:100%;height:100%;object-fit:cover;display:block}.media.video{display:flex;align-items:center;justify-content:center;background:#222;color:#fff;font-size:12px}.media .mark{position:absolute;right:3px;bottom:3px;background:#000b;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.media.anchor{border-color:#ff9500;box-shadow:0 0 0 2px #ff950044}.media.range{border-color:#0071e3}.entry-marker{font-size:11px;color:#0071e3;margin-top:7px}.entry-marker b{color:#ff9500}.compact .media:not(:first-child){display:none}.compact .media-strip{min-height:78px}
+.side{position:sticky;top:94px;align-self:start}.panel{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #e5e5ea}.panel h2{font-size:14px;margin:0 0 9px}.selection{font-size:12px;line-height:1.6;color:#555;min-height:48px}.selection strong{color:#1d1d1f}.count{font-size:12px;color:#0071e3;margin:8px 0}.draft{border-top:1px solid #e5e5ea;padding:9px 0;font-size:12px}.draft:first-of-type{border-top:0}.draft-title{font-weight:600}.draft-meta{color:#86868b;margin-top:3px}.empty{padding:40px 12px;text-align:center;color:#86868b;background:#fff;border-radius:12px}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.side{position:static}.day-title{top:94px}}
+</style></head><body>
+<header class="top" id="top"><div class="topline"><h1>📦 日常选品工作台</h1><span class="muted" id="capture"></span><span class="muted" id="summary"></span><label class="switch"><input id="history" type="checkbox"> 查看全部历史</label><button id="compact">显示全部图片</button><button id="supplierToggle" class="supplier-toggle" type="button" aria-expanded="true">收起供货商</button></div><div class="supplier-list" id="supplierList"></div></header>
+<main class="layout"><section class="timeline"><div class="tabs" id="tabs"></div><div id="entries"></div></section><aside class="side"><div class="panel"><h2>当前选择</h2><div class="selection" id="selection">先点击一张图作为起点</div><div class="count" id="rangeCount"></div><button class="primary" id="create" disabled>创建商品</button><button id="clear" style="margin-left:6px">清除选择</button></div><div class="panel"><h2>已创建商品 <span id="draftCount">0</span></h2><div id="drafts"><div class="muted">还没有创建商品</div></div><button class="danger" id="undo" disabled>撤销上一个商品</button><button class="primary" id="process" disabled style="margin-top:8px;width:100%">确认并开始处理</button></div></aside></main>
+<script>
+const DATA=__PAYLOAD__;
+const CAPTURE_TIME=__CAPTURE_TIME__;
+const state={active:null,history:false,compact:true,supplierOpen:true,selection:{start:null,end:null},drafts:[],locked:new Set()};
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const current=()=>DATA.find(s=>s.albumId===state.active);
+const items=()=>{const s=current();if(!s)return [];return state.history?s.items:s.items.filter(i=>i._new)};
+function init(){
+  const first=DATA.find(s=>s.newCount>0)||DATA[0];state.active=first?.albumId||null;
+  $('capture').textContent=CAPTURE_TIME?`数据抓取时间：${CAPTURE_TIME}`:'数据抓取时间：未知';renderSuppliers();renderTabs();render();
+}
+function renderSuppliers(){
+  $('supplierList').innerHTML=DATA.map(s=>`<label class="${s.newCount?'active':''}"><input type="checkbox" data-aid="${esc(s.albumId)}" ${s.newCount?'checked':''}><span>${esc(s.supplier)}</span><small>${s.newCount?`新增 ${s.newCount}`:'无新增'}</small></label>`).join('');
+  $('supplierList').querySelectorAll('input').forEach(input=>input.onchange=()=>{const selected=[...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid);if(!selected.includes(state.active))state.active=selected[0]||null;renderTabs();render();});
+}
+function setSupplierOpen(open){state.supplierOpen=open;$('top').classList.toggle('collapsed',!open);$('supplierToggle').textContent=open?'收起供货商':'展开供货商';$('supplierToggle').setAttribute('aria-expanded',String(open));}
+let lastScrollY=0;
+window.addEventListener('scroll',()=>{const y=window.scrollY;if(y<=24)setSupplierOpen(true);else if(y>lastScrollY&&state.supplierOpen)setSupplierOpen(false);lastScrollY=y},{passive:true});
+function selectedSuppliers(){const ids=new Set([...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid));return DATA.filter(s=>ids.has(s.albumId))}
+function renderTabs(){const chosen=selectedSuppliers();if(!chosen.some(s=>s.albumId===state.active))state.active=chosen[0]?.albumId||null;$('tabs').innerHTML=chosen.map(s=>`<button class="tab ${s.albumId===state.active?'active':''}" data-aid="${esc(s.albumId)}">${esc(s.supplier)} · ${state.history?s.items.length:s.newCount}</button>`).join('');$('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{state.active=b.dataset.aid;state.selection={start:null,end:null};renderTabs();render()});}
+function mediaFor(item){return item.workbenchMedia||[]}
+function sameAnchor(a,b){return a&&b&&a.goodsId===b.goodsId&&a.mediaIndex===b.mediaIndex}
+function currentRange(){const list=items(),s=state.selection;if(!s.start||!s.end)return null;const a=list.findIndex(i=>i.goods_id===s.start.goodsId),b=list.findIndex(i=>i.goods_id===s.end.goodsId);if(a<0||b<0)return null;const lo=Math.min(a,b),hi=Math.max(a,b);return {lo,hi,items:list.slice(lo,hi+1)};}
+function clickMedia(item,mediaIndex){
+  if(state.locked.has(item.goods_id))return;
+  const a={goodsId:item.goods_id,mediaIndex};
+  if(!state.selection.start)state.selection.start=a;
+  else if(!state.selection.end){if(sameAnchor(state.selection.start,a))state.selection={start:null,end:null};else state.selection.end=a}
+  else if(sameAnchor(state.selection.start,a)||sameAnchor(state.selection.end,a))state.selection={start:null,end:null};
+  else state.selection={start:a,end:null};
+  render();
+}
+function mediaHTML(item,mi,m,range){const anchor=sameAnchor(state.selection.start,{goodsId:item.goods_id,mediaIndex:mi})||sameAnchor(state.selection.end,{goodsId:item.goods_id,mediaIndex:mi});const inRange=range&&range.items.some(i=>i.goods_id===item.goods_id);const cls=['media',m.type==='video'?'video':'',anchor?'anchor':'',inRange?'range':''].filter(Boolean).join(' ');if(m.type==='video')return `<button class="${cls}" data-goods="${esc(item.goods_id)}" data-media="${mi}" title="视频（点击选择）">🎬 视频</button>`;return `<button class="${cls}" data-goods="${esc(item.goods_id)}" data-media="${mi}" title="点击选择"><img loading="lazy" decoding="async" src="${esc(m.thumb||thumbFallback(m.url))}"><span class="mark">${mi+1}</span></button>`}
+function thumbFallback(url){const clean=String(url||'').split('?')[0];return clean+'?imageMogr2/thumbnail/!200x200r/quality/80'}
+function render(){
+  const s=current(),list=items(),range=currentRange();
+  $('summary').textContent=s?`${s.supplier} · ${state.history?list.length:`${list.length}/${s.items.length} 条新增`}`:'请先选择供货商';
+  $('entries').className=state.compact?'compact':'';
+  if(!s||!list.length){$('entries').innerHTML='<div class="empty">当前没有可展示的内容</div>';renderSide(null);return}
+  let html='',lastDate='';list.forEach((item,index)=>{const date=item.workbenchDate||'';if(date!==lastDate){html+=`<div class="day"><div class="day-title">${date}</div>`;lastDate=date}const locked=state.locked.has(item.goods_id),inRange=range?.items.some(i=>i.goods_id===item.goods_id);const media=mediaFor(item);html+=`<article class="entry ${locked?'locked ':''}${inRange?'selected':''}"><div class="entry-head"><div class="entry-info"><div class="entry-time">${esc(item.workbenchTime||'时间未知')}</div><div class="entry-title">${esc(item.title||'(无文案)')}</div></div><div class="entry-badge">${media.length} 个素材${locked?' · 已创建':''}</div></div><div class="media-strip">${media.map((m,mi)=>mediaHTML(item,mi,m,range)).join('')}</div>${inRange?'<div class="entry-marker">已在当前范围内</div>':''}</article>`;const nextDate=list[index+1]?.workbenchDate;if(index===list.length-1||date!==nextDate)html+='</div>'});
+  $('entries').innerHTML=html;$('entries').querySelectorAll('.media').forEach(b=>b.onclick=()=>clickMedia(list.find(i=>i.goods_id===b.dataset.goods),Number(b.dataset.media)));renderSide(range);
+}
+function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 第${a.mediaIndex+1}个素材`};$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;$('drafts').innerHTML=state.drafts.length?state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join(''):'<div class="muted">还没有创建商品</div>'}
+ $('supplierToggle').onclick=()=>{setSupplierOpen(!state.supplierOpen);lastScrollY=window.scrollY};$('history').onchange=()=>{state.history=$('history').checked;state.selection={start:null,end:null};renderTabs();render()};$('compact').onclick=()=>{state.compact=!state.compact;$('compact').textContent=state.compact?'显示全部图片':'只显示首图';render()};$('clear').onclick=()=>{state.selection={start:null,end:null};render()};$('create').onclick=()=>{const r=currentRange(),s=current();if(!r||!s)return;const ids=r.items.map(i=>i.goods_id);if(ids.some(id=>state.locked.has(id)))return;const draft={supplier:s.supplier,albumId:s.albumId,items:r.items,index:state.drafts.filter(d=>d.albumId===s.albumId).length+1,label:`${ids[0]} → ${ids[ids.length-1]}`};state.drafts.push(draft);ids.forEach(id=>state.locked.add(id));state.selection={start:null,end:null};render()};$('undo').onclick=()=>{const d=state.drafts.pop();if(d)d.items.forEach(i=>state.locked.delete(i.goods_id));render()};$('process').onclick=()=>{const grouped=[];const by=new Map();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,...raw}=i;return raw};state.drafts.forEach(d=>{if(!by.has(d.albumId)){const value={supplier:d.supplier,albumId:d.albumId,groups:[]};by.set(d.albumId,value);grouped.push(value)}by.get(d.albumId).groups.push(d.items.map(cleanItem))});const blob=new Blob([JSON.stringify({suppliers:grouped},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='confirmed_groups.json';a.click();$('process').disabled=true;alert('已生成 confirmed_groups.json，回到终端继续处理');};init();
+</script></body></html>'''
+    html = html.replace("__PAYLOAD__", payload).replace("__CAPTURE_TIME__", capture_payload)
+    out_path.write_text(html, encoding="utf-8")
+
+
 def build_preview_html(previews, out_path):
     """previews: [{supplier, albumId, posts:[...], boundaries:[bool]}]
     boundaries[i]=True 表示 posts[i] 与 posts[i+1] 之间是分界(不同产品).
@@ -1328,6 +1467,28 @@ def cmd_preview(config, progress, data, code=""):
     except Exception:
         print(f"  请手动打开: {out}")
     print(f"  然后运行: python3 pick_products.py process ~/Downloads/confirmed_groups.json")
+
+
+def cmd_workbench(config, progress, data, scrape_path=""):
+    """生成日常选品工作台: 默认新增, 可切换全部历史, 输出现有确认格式."""
+    suppliers = _workbench_payload(data, progress)
+    if not suppliers:
+        print("没有可展示的内容"); return False
+    out = SCRIPT_DIR / "日常选品工作台.html"
+    capture_time = ""
+    if scrape_path and Path(scrape_path).exists():
+        capture_time = datetime.fromtimestamp(
+            Path(scrape_path).stat().st_mtime
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    build_workbench_html(suppliers, out, capture_time=capture_time)
+    print(f"\n✓ 工作台已生成: {out}")
+    print("  默认展示新增内容; 可切换供货商和全部历史, 选择起止素材后创建商品")
+    try:
+        _open_in_browser(out)
+        print("  已在浏览器打开, 全部商品选完后点‘确认并开始处理’")
+    except Exception:
+        print(f"  请手动打开: {out}")
+    return True
 
 
 def _normalize_date(date_str):
@@ -1866,6 +2027,53 @@ def cmd_process_confirmed(config, progress, confirmed_path):
     print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
 
 
+def _open_szwego_in_chrome():
+    url = "https://www.szwego.com/static/index.html"
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            subprocess.run(["open", "-a", "Google Chrome", url], check=False)
+        else:
+            import webbrowser
+            webbrowser.open(url)
+    except Exception:
+        print(f"  请手动打开: {url}")
+
+
+def wait_for_fresh_download(base, before_mtime=0, timeout=600):
+    """等待 Chrome 扩展生成新的下载文件, 兼容 Chrome 自动加 (1) 后缀."""
+    print(f"\n⏳ 等待 Chrome 扩展抓取最新数据... (最长 {timeout} 秒)")
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            path = pick_newest_download(base)
+            if path and path.stat().st_mtime > before_mtime:
+                size = path.stat().st_size
+                time.sleep(0.5)
+                if path.stat().st_size == size and size > 0:
+                    return path
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n已取消等待"); return None
+    print("\n⚠ 未收到新的抓取文件")
+    return None
+
+
+def refresh_daily_scrape(timeout=600):
+    """打开已登录的微购相册, 由扩展抓取并返回最新 scrape_all 文件."""
+    previous = pick_newest_download("scrape_all")
+    before_mtime = previous.stat().st_mtime if previous else 0
+    _open_szwego_in_chrome()
+    print("  已打开微购相册, Chrome 扩展应自动开始抓取")
+    path = wait_for_fresh_download("scrape_all", before_mtime, timeout)
+    if path:
+        captured = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  ✓ 数据抓取完成: {captured} ({path.name})")
+    else:
+        print("  请确认扩展已加载、账号已登录, 或使用旧书签抓取")
+    return path
+
+
 def wait_for_confirmed(watch_dir=None, timeout=600):
     """监听 Downloads 目录, 等 confirmed_groups.json 出现. 返回路径或 None(超时/取消)."""
     watch_dir = watch_dir or (Path.home() / "Downloads")
@@ -1894,7 +2102,46 @@ def _load_all_supplier_ids(config):
     return json.dumps(config.get("suppliers", {}), ensure_ascii=False)
 
 
-def cmd_install_bookmark(config):
+def _write_chrome_extension(config, capture_script):
+    """把当前供应商配置和同一份抓取脚本写成可加载的 Chrome 扩展."""
+    CHROME_EXTENSION_DIR.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "manifest_version": 3,
+        "name": "微购相册自动抓取",
+        "version": "1.0.0",
+        "description": "打开微购相册上新页后自动抓取供应商上新数据",
+        "content_scripts": [{
+            "matches": ["https://www.szwego.com/static/index.html*"],
+            "js": ["content.js"],
+            "run_at": "document_idle",
+        }],
+        "host_permissions": ["https://www.szwego.com/*"],
+    }
+    (CHROME_EXTENSION_DIR / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (CHROME_EXTENSION_DIR / "content.js").write_text(
+        "// 自动生成, 供应商配置来自 config.json\n"
+        + capture_script.replace("alert(", "console.log("),
+        encoding="utf-8",
+    )
+    (CHROME_EXTENSION_DIR / "README.md").write_text(
+        """# 微购相册自动抓取扩展
+
+1. 打开 Chrome `chrome://extensions/`。
+2. 打开右上角「开发者模式」。
+3. 点击「加载已解压的扩展程序」，选择本目录。
+4. 登录微购相册后打开 `https://www.szwego.com/static/index.html`。
+
+扩展会自动抓取 `config.json` 中的供货商，并下载 `scrape_all.json`。
+供应商配置变化后，重新运行 `python3 pick_products.py extension`，再在扩展页点刷新。
+""",
+        encoding="utf-8",
+    )
+    print(f"✓ Chrome 扩展已生成: {CHROME_EXTENSION_DIR}")
+
+
+def cmd_install_bookmark(config, open_install=True):
     """生成一个 HTML, 你拖里面的按钮到浏览器书签栏即可."""
     suppliers_js = _load_all_supplier_ids(config)
     # 书签的 javascript: URL — 编码为 URI 保证在 href 里合法
@@ -2031,14 +2278,23 @@ code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:13px}
         + bookmarklet_body.replace("__SUPPLIERS__", suppliers_js).replace("alert(", "console.log(")
     )
     (SCRIPT_DIR / "paste_to_console.js").write_text(console_js, encoding="utf-8")
+    _write_chrome_extension(config, console_js)
     print(f"✓ 书签安装页已生成: {BOOKMARKLET_FILE}")
     print(f"✓ 兜底 console 脚本: {SCRIPT_DIR / 'paste_to_console.js'}")
+    if not open_install:
+        return
     try:
         import webbrowser
         webbrowser.open(BOOKMARKLET_FILE.as_uri())
         print("  已在浏览器打开, 拖蓝色按钮到书签栏即可")
     except Exception:
         print(f"  请手动打开: {BOOKMARKLET_FILE}")
+
+
+def cmd_install_extension(config):
+    """生成 Chrome 扩展, 不打开旧书签安装页."""
+    cmd_install_bookmark(config, open_install=False)
+    print("  Chrome: chrome://extensions/ → 开发者模式 → 加载已解压的扩展程序")
 
 
 def _apply_defaults(config):
@@ -2114,7 +2370,7 @@ def main():
     # 位置参数: [mode] [模式参数...]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
     mode = ""
-    if positional and positional[0] in ("preview", "process", "run", "bookmark", "anchor", "range"):
+    if positional and positional[0] in ("preview", "workbench", "process", "run", "bookmark", "extension", "anchor", "range"):
         mode = positional.pop(0)
     mode_args = list(positional)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
@@ -2134,6 +2390,9 @@ def main():
     # bookmark: 生成书签安装页
     if mode == "bookmark":
         cmd_install_bookmark(config); return
+
+    if mode == "extension":
+        cmd_install_extension(config); return
 
     # process: 老入口, 自动化脚本用. 交互模式默认走合并流程, 不再需要用户手动 process
     if mode == "process":
@@ -2309,7 +2568,11 @@ def main():
             _print_batch_summary(results)
         return
 
-    scrape_path = env_scrape or (str(pick_newest_download("scrape_all") or ""))
+    if mode in ("", "workbench") and not env_scrape:
+        fresh = refresh_daily_scrape()
+        scrape_path = str(fresh or "")
+    else:
+        scrape_path = env_scrape or (str(pick_newest_download("scrape_all") or ""))
     run_targets = []
     if mode == "run":
         run_targets = _parse_batch_targets("run", mode_args)
@@ -2420,8 +2683,12 @@ def main():
             total += process_supplier(name, aid, data[aid]["items"], progress, feishu, fs_cfg, ai_cfg, code=code)
         print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品"); return
 
-    # 默认: 交互全流程 (preview 单独也走这个, 但不等待/不处理)
-    cmd_preview(config, progress, data, code=code)
+    # 默认: 可视化选品工作台; preview 保留旧的分组预览入口
+    if mode == "workbench" or not mode:
+        if not cmd_workbench(config, progress, data, scrape_path):
+            return
+    else:
+        cmd_preview(config, progress, data, code=code)
     if mode == "preview":
         return   # 显式 preview: 只生成预览, 不等待
 
