@@ -65,6 +65,8 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn('loading="lazy"', html)
         self.assertIn("confirmed_groups.json", html)
         self.assertIn("创建商品", html)
+        self.assertIn('id="dateFilter"', html)
+        self.assertIn('data-date=', html)
 
 
 if __name__ == "__main__":
