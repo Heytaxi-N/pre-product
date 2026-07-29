@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pick_products
 
@@ -63,10 +64,29 @@ class WorkbenchTests(unittest.TestCase):
             html = out.read_text()
 
         self.assertIn('loading="lazy"', html)
-        self.assertIn("confirmed_groups.json", html)
+        self.assertIn("confirmed_groups_", html)
+        self.assertIn("state.drafts=[]", html)
         self.assertIn("创建商品", html)
         self.assertIn('id="dateFilter"', html)
         self.assertIn('data-date=', html)
+
+    def test_wait_for_confirmed_accepts_timestamped_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "confirmed_groups_1234567890.json"
+            path.write_text("{}")
+            with patch.object(pick_products.time, "sleep", return_value=None):
+                found = pick_products.wait_for_confirmed(Path(tmp), timeout=1)
+
+        self.assertEqual(path, found)
+
+    def test_wait_for_confirmed_can_wait_indefinitely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "confirmed_groups_1234567890.json"
+            path.write_text("{}")
+            with patch.object(pick_products.time, "sleep", return_value=None):
+                found = pick_products.wait_for_confirmed(Path(tmp), timeout=None)
+
+        self.assertEqual(path, found)
 
 
 if __name__ == "__main__":

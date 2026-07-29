@@ -1267,7 +1267,7 @@ function render(){
   $('entries').innerHTML=html;$('entries').querySelectorAll('.media').forEach(b=>b.onclick=()=>clickMedia(list.find(i=>i.goods_id===b.dataset.goods),Number(b.dataset.media)));$('entries').querySelectorAll('.day-title').forEach(b=>b.onclick=()=>{state.date=b.dataset.date;state.selection={start:null,end:null};renderDateFilter();render()});renderSide(range);
 }
 function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 第${a.mediaIndex+1}个素材`};$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;$('drafts').innerHTML=state.drafts.length?state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join(''):'<div class="muted">还没有创建商品</div>'}
- $('supplierToggle').onclick=()=>{setSupplierOpen(!state.supplierOpen);lastScrollY=window.scrollY};$('dateFilter').onchange=()=>{state.date=$('dateFilter').value;state.selection={start:null,end:null};render()};$('history').onchange=()=>{state.history=$('history').checked;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()};$('compact').onclick=()=>{state.compact=!state.compact;$('compact').textContent=state.compact?'显示全部图片':'只显示首图';render()};$('clear').onclick=()=>{state.selection={start:null,end:null};render()};$('create').onclick=()=>{const r=currentRange(),s=current();if(!r||!s)return;const ids=r.items.map(i=>i.goods_id);if(ids.some(id=>state.locked.has(id)))return;const draft={supplier:s.supplier,albumId:s.albumId,items:r.items,index:state.drafts.filter(d=>d.albumId===s.albumId).length+1,label:`${ids[0]} → ${ids[ids.length-1]}`};state.drafts.push(draft);ids.forEach(id=>state.locked.add(id));state.selection={start:null,end:null};render()};$('undo').onclick=()=>{const d=state.drafts.pop();if(d)d.items.forEach(i=>state.locked.delete(i.goods_id));render()};$('process').onclick=()=>{const grouped=[];const by=new Map();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,...raw}=i;return raw};state.drafts.forEach(d=>{if(!by.has(d.albumId)){const value={supplier:d.supplier,albumId:d.albumId,groups:[]};by.set(d.albumId,value);grouped.push(value)}by.get(d.albumId).groups.push(d.items.map(cleanItem))});const blob=new Blob([JSON.stringify({suppliers:grouped},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='confirmed_groups.json';a.click();$('process').disabled=true;alert('已生成 confirmed_groups.json，回到终端继续处理');};init();
+ $('supplierToggle').onclick=()=>{setSupplierOpen(!state.supplierOpen);lastScrollY=window.scrollY};$('dateFilter').onchange=()=>{state.date=$('dateFilter').value;state.selection={start:null,end:null};render()};$('history').onchange=()=>{state.history=$('history').checked;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()};$('compact').onclick=()=>{state.compact=!state.compact;$('compact').textContent=state.compact?'显示全部图片':'只显示首图';render()};$('clear').onclick=()=>{state.selection={start:null,end:null};render()};$('create').onclick=()=>{const r=currentRange(),s=current();if(!r||!s)return;const ids=r.items.map(i=>i.goods_id);if(ids.some(id=>state.locked.has(id)))return;const draft={supplier:s.supplier,albumId:s.albumId,items:r.items,index:state.drafts.filter(d=>d.albumId===s.albumId).length+1,label:`${ids[0]} → ${ids[ids.length-1]}`};state.drafts.push(draft);ids.forEach(id=>state.locked.add(id));state.selection={start:null,end:null};render()};$('undo').onclick=()=>{const d=state.drafts.pop();if(d)d.items.forEach(i=>state.locked.delete(i.goods_id));render()};$('process').onclick=()=>{const batch=state.drafts.slice();if(!batch.length)return;const grouped=[];const by=new Map();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,...raw}=i;return raw};batch.forEach(d=>{if(!by.has(d.albumId)){const value={supplier:d.supplier,albumId:d.albumId,groups:[]};by.set(d.albumId,value);grouped.push(value)}by.get(d.albumId).groups.push(d.items.map(cleanItem))});const blob=new Blob([JSON.stringify({suppliers:grouped},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`confirmed_groups_${Date.now()}.json`;a.click();state.drafts=[];state.selection={start:null,end:null};render();alert(`已提交 ${batch.length} 个商品，继续选择新商品即可提交下一批`);};init();
 </script></body></html>'''
     html = html.replace("__PAYLOAD__", payload).replace("__CAPTURE_TIME__", capture_payload)
     out_path.write_text(html, encoding="utf-8")
@@ -1706,6 +1706,12 @@ def pick_newest_download(base):
     return dls[-1]
 
 
+def _confirmed_download_paths(watch_dir):
+    """找出工作台提交的 confirmed_groups 文件, 兼容旧名和带时间戳的新名."""
+    pattern = re.compile(r"^confirmed_groups(?:_\d+)?(?: \(\d+\))?\.json$")
+    return [p for p in watch_dir.iterdir() if pattern.fullmatch(p.name)] if watch_dir.exists() else []
+
+
 def ensure_data_for_date(
         scrape_path, config, supplier_name, date_str, timeout=240, code="",
         force_fetch=True, range_start="", range_end="", raise_interrupt=False):
@@ -2077,18 +2083,23 @@ def refresh_daily_scrape(timeout=600):
     return path
 
 
-def wait_for_confirmed(watch_dir=None, timeout=600):
-    """监听 Downloads 目录, 等 confirmed_groups.json 出现. 返回路径或 None(超时/取消)."""
+def wait_for_confirmed(watch_dir=None, timeout=None):
+    """监听 Downloads 目录, 等新的 confirmed_groups 文件出现. 返回路径或 None(超时/取消)."""
     watch_dir = watch_dir or (Path.home() / "Downloads")
-    target = watch_dir / "confirmed_groups.json"
     # 忽略比启动更早的旧文件
     start_ts = time.time() - 1
-    print(f"\n⏳ 等浏览器里点「确认并下载」... (最长 {timeout} 秒, Ctrl+C 退出)")
-    print(f"   监听: {target}")
-    end = time.time() + timeout
+    wait_hint = f"最长 {timeout} 秒" if timeout is not None else "一直等待"
+    print(f"\n⏳ 等浏览器里点「确认并下载」... ({wait_hint}, Ctrl+C 退出)")
+    print(f"   监听: {watch_dir}/confirmed_groups*.json")
+    end = time.time() + timeout if timeout is not None else None
     try:
-        while time.time() < end:
-            if target.exists() and target.stat().st_mtime > start_ts:
+        while end is None or time.time() < end:
+            candidates = [
+                path for path in _confirmed_download_paths(watch_dir)
+                if path.stat().st_mtime > start_ts
+            ]
+            if candidates:
+                target = max(candidates, key=lambda path: path.stat().st_mtime)
                 # 稳定性: 等文件写完 (大小连续 2 次一致)
                 s1 = target.stat().st_size
                 time.sleep(0.5)
@@ -2695,18 +2706,19 @@ def main():
     if mode == "preview":
         return   # 显式 preview: 只生成预览, 不等待
 
-    # 合并流程: 等 confirmed_groups.json 出现后自动接着 process
-    confirmed = wait_for_confirmed()
-    if not confirmed:
-        print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
-        return
-    print(f"\n✓ 收到确认文件: {confirmed}, 开始处理...")
-    cmd_process_confirmed(config, progress, str(confirmed))
-    # 处理完把 confirmed 挪走, 避免下次误触
-    try:
-        confirmed.rename(confirmed.with_suffix(".done.json"))
-    except Exception:
-        pass
+    # 合并流程: 每批处理完成后继续等待下一批, 直到 Ctrl+C.
+    while True:
+        confirmed = wait_for_confirmed()
+        if not confirmed:
+            print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
+            return
+        print(f"\n✓ 收到确认文件: {confirmed}, 开始处理...")
+        cmd_process_confirmed(config, progress, str(confirmed))
+        # 处理完把当前批次挪走, 避免下一轮误触.
+        try:
+            confirmed.rename(confirmed.with_suffix(".done.json"))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
