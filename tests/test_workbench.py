@@ -38,6 +38,10 @@ class WorkbenchTests(unittest.TestCase):
             ["image", "video"],
             [media["type"] for media in first["workbenchMedia"]],
         )
+        self.assertEqual(
+            "https://example.com/one.mp4?vframe/jpg/offset/0",
+            first["workbenchMedia"][1]["thumb"],
+        )
 
     def test_html_contains_lazy_media_and_existing_confirmation_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,6 +60,10 @@ class WorkbenchTests(unittest.TestCase):
                             "type": "image",
                             "thumb": "https://example.com/one-thumb.jpg",
                             "url": "https://example.com/one.jpg",
+                        }, {
+                            "type": "video",
+                            "thumb": "",
+                            "url": "https://example.com/one.mp4",
                         }],
                     }],
                 }],
@@ -69,6 +77,9 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("创建商品", html)
         self.assertIn('id="dateFilter"', html)
         self.assertIn('data-date=', html)
+        self.assertIn('id="media-hover-preview"', html)
+        self.assertIn("videoThumbFallback", html)
+        self.assertIn("mouseenter", html)
 
     def test_wait_for_confirmed_accepts_timestamped_download(self):
         with tempfile.TemporaryDirectory() as tmp:
