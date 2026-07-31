@@ -46,7 +46,7 @@ class DailyReliabilityTests(unittest.TestCase):
         self.assertEqual([], paths)
         self.assertFalse(tmp_dir.exists())
 
-    def test_progress_dict_keeps_unprocessed_same_day_and_old_string_works(self):
+    def test_progress_dict_keeps_unprocessed_same_day_and_old_string_migrates(self):
         old = make_item("old", publish_minute=-24 * 60)
         done = make_item("done")
         pending = make_item("pending", publish_minute=1)
@@ -69,13 +69,72 @@ class DailyReliabilityTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            ["tomorrow"],
+            ["done", "pending", "tomorrow"],
             [
                 item["goods_id"]
                 for item in pick_products.filter_new_items(
                     "album-1", items, {"album-1": "2026-07-24"}
                 )
             ],
+        )
+
+    def test_processed_item_with_new_version_is_detected_as_updated(self):
+        original = make_item("done", update_minute=1)
+        changed = make_item("done", update_minute=2, title="改过的商品")
+        progress = {
+            "album-1": {
+                "cutoff_date": "2026-07-24",
+                "processed_ids": ["done"],
+                "processed_versions": {
+                    "done": pick_products._item_version(original),
+                },
+            }
+        }
+
+        self.assertEqual(
+            ["done"],
+            [
+                item["goods_id"]
+                for item in pick_products.filter_new_items(
+                    "album-1", [changed], progress
+                )
+            ],
+        )
+        self.assertEqual(
+            "updated",
+            pick_products._progress_item_status(changed, progress["album-1"]),
+        )
+
+    def test_workbench_marks_new_updated_failed_and_done(self):
+        done = make_item("done", update_minute=1)
+        changed = make_item("changed", update_minute=2)
+        failed = make_item("failed", update_minute=3)
+        new = make_item("new", update_minute=4)
+        progress = {
+            "album-1": {
+                "cutoff_date": "2026-07-24",
+                "processed_ids": ["done", "changed"],
+                "processed_versions": {
+                    "done": pick_products._item_version(done),
+                    "changed": pick_products._item_version(make_item("changed", update_minute=1)),
+                },
+                "failed_versions": {
+                    "failed": pick_products._item_version(failed),
+                },
+            }
+        }
+
+        payload = pick_products._workbench_payload(
+            {"album-1": {"supplier": "测试供货商", "items": [done, changed, failed, new]}},
+            progress,
+        )
+        statuses = {
+            item["goods_id"]: item["workbenchStatus"]
+            for item in payload[0]["items"]
+        }
+        self.assertEqual(
+            {"done": "done", "changed": "updated", "failed": "failed", "new": "new"},
+            statuses,
         )
 
     def test_process_groups_records_only_successful_goods_ids(self):
@@ -120,7 +179,7 @@ class DailyReliabilityTests(unittest.TestCase):
                 )
 
         self.assertEqual(1, count)
-        save.assert_called_once()
+        self.assertGreaterEqual(save.call_count, 1)
         album_progress = progress["album-1"]
         self.assertIsInstance(album_progress, dict)
         self.assertEqual("2026-07-24", album_progress["cutoff_date"])
@@ -248,11 +307,15 @@ class DailyReliabilityTests(unittest.TestCase):
                 )
 
         self.assertEqual(0, count)
-        self.assertEqual({}, progress)
-        create_folder.assert_not_called()
-        self.assertFalse(
-            any(call.args[0] == pick_products.PROGRESS_FILE for call in save.call_args_list)
+        self.assertEqual(
+            pick_products._item_version(item),
+            progress["album-1"]["failed_versions"]["feishu-failed"],
         )
+        create_folder.assert_not_called()
+        self.assertTrue(any(
+            call.args[0] == pick_products.PROGRESS_FILE
+            for call in save.call_args_list
+        ))
 
     def test_group_products_ai_uses_update_order_and_gap(self):
         update_first = make_item(

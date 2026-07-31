@@ -22,6 +22,10 @@ CHROME_EXTENSION_DIR = SCRIPT_DIR / "chrome-extension"
 GROUP_TIME_GAP = 120  # 秒: 帖子时间间隔 < 此值归为同一产品
 
 
+def _project_data_dir():
+    return SCRIPT_DIR / "data"
+
+
 # ── HTTP 会话 ────────────────────────────────────────
 def http_get_bytes(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -633,40 +637,121 @@ def _progress_date(progress, album_id):
         return str(v.get("cutoff_date") or "")
     return str(v)
 
-def filter_new_items(album_id, raw_items, progress):
-    """旧进度按日期过滤; 新进度同时记录成功 goods_id, 支持同日增量和失败重试."""
+
+def _item_version(it):
+    """用条目内容和源更新时间生成稳定版本, 不再只依赖发布日期."""
+    payload = {
+        "title": it.get("title") or "",
+        "imgsSrc": list(it.get("imgsSrc") or []),
+        "videoUrl": it.get("videoUrl") or it.get("videoURL") or "",
+        "time_stamp": it.get("time_stamp"),
+        "update_time": it.get("update_time"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _new_progress_state(cutoff_date=""):
+    return {
+        "schema": 2,
+        "cutoff_date": cutoff_date,
+        "processed_ids": [],
+        "processed_versions": {},
+        "failed_versions": {},
+    }
+
+
+def _ensure_progress_state(album_id, raw_items, progress):
+    """将旧日期/ID进度迁移到版本进度, 返回可继续使用的状态."""
     state = progress.get(album_id)
-    if state is None and raw_items:
-        max_date = max(_item_date(it) for it in raw_items)
-        return [it for it in raw_items if _item_date(it) == max_date]
-    if isinstance(state, dict):
+    by_id = {it.get("goods_id"): it for it in raw_items if it.get("goods_id")}
+    if state is None:
+        cutoff = max((_item_date(it) for it in raw_items), default="")
+        state = _new_progress_state(cutoff)
+        # 首次启用仍只把最新发布日期作为待选, 历史内容建立基线.
+        state["processed_versions"] = {
+            gid: _item_version(it)
+            for gid, it in by_id.items()
+            if _item_date(it) < cutoff
+        }
+    elif not isinstance(state, dict):
+        cutoff = _progress_date(progress, album_id)
+        state = _new_progress_state(cutoff)
+        # 旧日期无法还原当天哪些已处理, 当天内容宁可多展示一次, 不静默漏掉.
+        state["processed_versions"] = {
+            gid: _item_version(it)
+            for gid, it in by_id.items()
+            if _item_date(it) < cutoff
+        }
+    else:
+        state.setdefault("schema", 2)
+        state.setdefault("cutoff_date", "")
+        state.setdefault("processed_ids", [])
+        state.setdefault("processed_versions", {})
+        state.setdefault("failed_versions", {})
+        processed_versions = state["processed_versions"]
+        for gid in state["processed_ids"]:
+            if gid not in processed_versions and gid in by_id:
+                processed_versions[gid] = _item_version(by_id[gid])
         cutoff = str(state.get("cutoff_date") or "")
-        processed = set(state.get("processed_ids") or [])
-        return [
-            it for it in raw_items
-            if _item_date(it) >= cutoff and it.get("goods_id") not in processed
-        ]
-    last_date = _progress_date(progress, album_id)
-    return [it for it in raw_items if _item_date(it) > last_date]
+        for gid, it in by_id.items():
+            if cutoff and _item_date(it) < cutoff and gid not in processed_versions:
+                processed_versions[gid] = _item_version(it)
+    state["processed_ids"] = sorted(state["processed_versions"])
+    progress[album_id] = state
+    return state
+
+
+def _progress_item_status(it, state):
+    """返回 new / updated / failed / done, 版本变化优先标为 updated."""
+    gid = it.get("goods_id")
+    version = _item_version(it)
+    processed_versions = state.get("processed_versions") or {}
+    failed_versions = state.get("failed_versions") or {}
+    if processed_versions.get(gid) == version:
+        return "done"
+    if failed_versions.get(gid) == version:
+        return "failed"
+    if gid in processed_versions or gid in failed_versions:
+        return "updated"
+    return "new"
+
+
+def filter_new_items(album_id, raw_items, progress):
+    """返回未成功处理或版本已变化的条目, 兼容旧日期进度."""
+    state = _ensure_progress_state(album_id, raw_items, progress)
+    return [it for it in raw_items if _progress_item_status(it, state) != "done"]
 
 
 def _record_processed_ids(progress, album_id, groups, processed_ids):
-    """记录实际成功落盘的帖子; processed_ids 可跨日期增长, 避免部分失败被跳过."""
-    state = progress.get(album_id)
-    if isinstance(state, dict):
-        cutoff = str(state.get("cutoff_date") or "")
-        done = set(state.get("processed_ids") or [])
-    else:
-        cutoff = _progress_date(progress, album_id)
-        done = set()
-    if not cutoff:
-        cutoff = min(_item_date(it) for group in groups for it in group)
-    done.update(processed_ids)
-    progress[album_id] = {
-        "cutoff_date": cutoff,
-        "processed_ids": sorted(done),
-    }
+    """记录实际成功落盘的帖子和当时版本, 避免部分失败被跳过."""
+    raw_items = [it for group in groups for it in group]
+    state = _ensure_progress_state(album_id, raw_items, progress)
+    versions = state["processed_versions"]
+    failed = state["failed_versions"]
+    by_id = {it.get("goods_id"): it for it in raw_items}
+    for gid in processed_ids:
+        if gid in by_id:
+            versions[gid] = _item_version(by_id[gid])
+            failed.pop(gid, None)
+    state["processed_ids"] = sorted(versions)
     save_json(PROGRESS_FILE, progress)
+
+
+def _record_failed_ids(progress, album_id, items):
+    """记录失败版本, 版本变化后会自动从 failed 变为 updated 重试."""
+    state = _ensure_progress_state(album_id, items, progress)
+    failed = state["failed_versions"]
+    for it in items:
+        gid = it.get("goods_id")
+        if gid:
+            failed[gid] = _item_version(it)
+    save_json(PROGRESS_FILE, progress)
+
+
+def _items_for_goods_ids(groups, goods_ids):
+    wanted = set(goods_ids)
+    return [it for group in groups for it in group if it.get("goods_id") in wanted]
 
 
 def _img_data_url(p):
@@ -916,8 +1001,8 @@ def wait_for_classify_review(
                 if p.stat().st_size != s1:
                     continue
                 try:
+                    p = _archive_download(p)
                     prods = json.loads(p.read_text()).get("prods")
-                    p.unlink()
                     print("  ✓ 收到排序确认, 应用人工调整")
                     return prods
                 except Exception as e:
@@ -959,6 +1044,8 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
             print("  图片未完整下载或没有图片, 跳过")
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            if advance_progress:
+                _record_failed_ids(progress, album_id, group)
             continue
         # 相同的图只保留1张(按内容哈希去重, 保持顺序)
         # ponytail: 精确字节去重; 需要"视觉近似"去重时再上感知哈希
@@ -1073,6 +1160,11 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                 print(f"  ⚠ 飞书失败, 本产品不生成且不记进度: {e}")
                 if pr["tmp_dir"].exists():
                     shutil.rmtree(pr["tmp_dir"], ignore_errors=True)
+                if advance_progress:
+                    _record_failed_ids(
+                        progress, album_id,
+                        _items_for_goods_ids(groups, pr["goods_ids"]),
+                    )
                 continue
         try:
             create_product_folder(final, folder_name, OUTPUT_DIR)
@@ -1080,6 +1172,11 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
             print(f"  ⚠ 文件夹生成失败, 本产品不记进度: {e}")
             if pr["tmp_dir"].exists():
                 shutil.rmtree(pr["tmp_dir"], ignore_errors=True)
+            if advance_progress:
+                _record_failed_ids(
+                    progress, album_id,
+                    _items_for_goods_ids(groups, pr["goods_ids"]),
+                )
             continue
         if pr["tmp_dir"].exists():
             shutil.rmtree(pr["tmp_dir"])
@@ -1181,16 +1278,26 @@ def _workbench_payload(data, progress):
             key=_workbench_datetime,
             reverse=True,
         )
-        if not all_items:
+        capture_ok = bucket.get("capture_ok")
+        if not all_items and capture_ok is not False:
             continue
+        state = _ensure_progress_state(aid, all_items, progress)
+        statuses = {
+            item.get("goods_id"): _progress_item_status(item, state)
+            for item in all_items
+        }
         new_ids = {
-            item.get("goods_id")
-            for item in filter_new_items(aid, all_items, progress)
+            gid for gid, status in statuses.items() if status != "done"
+        }
+        status_counts = {
+            status: sum(1 for value in statuses.values() if value == status)
+            for status in ("new", "updated", "failed", "done")
         }
         workbench_items = []
         for item in all_items:
             value = _workbench_item(item)
-            value["_new"] = item.get("goods_id") in new_ids
+            value["workbenchStatus"] = statuses.get(item.get("goods_id"), "new")
+            value["_new"] = value["workbenchStatus"] != "done"
             value["workbenchDate"] = _workbench_datetime(item).strftime("%m/%d")
             value["workbenchTime"] = _workbench_datetime(item).strftime("%m/%d %H:%M")
             workbench_items.append(value)
@@ -1198,6 +1305,10 @@ def _workbench_payload(data, progress):
             "supplier": bucket.get("supplier", aid[-8:]),
             "albumId": aid,
             "newCount": len(new_ids),
+            "statusCounts": status_counts,
+            "captureOk": capture_ok,
+            "captureAt": bucket.get("captured_at", ""),
+            "captureError": bucket.get("capture_error", ""),
             "items": workbench_items,
         })
     return suppliers
@@ -1219,13 +1330,13 @@ button.primary{background:#0071e3;color:#fff;border-color:#0071e3;font-weight:60
 button.danger{color:#c62828}.switch{display:inline-flex;gap:6px;align-items:center;font-size:13px}.supplier-list{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;max-height:2000px;overflow:hidden;opacity:1}.top.collapsed .supplier-list{max-height:0;margin-top:0;opacity:0;pointer-events:none}.top.collapsed .supplier-toggle{display:inline-flex}
 .supplier-list label{display:inline-flex;align-items:center;gap:5px;background:#f5f5f7;border-radius:18px;padding:6px 10px;font-size:13px;cursor:pointer}.supplier-list label.active{background:#e8f2ff;color:#0066cc}
 .supplier-list small{color:#86868b}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;max-width:1500px;margin:0 auto;padding:14px}.timeline{min-width:0}.tabs{position:sticky;top:var(--top-height);z-index:12;display:flex;gap:6px;overflow:auto;padding:8px 0;background:#f5f5f7}.tab{white-space:nowrap}.tab.active{border-color:#0071e3;color:#0071e3;background:#e8f2ff}
-.day{margin:14px 0}.day-title{position:sticky;top:calc(var(--top-height) + var(--tabs-height));z-index:4;display:block;width:100%;border:0;border-radius:0;background:#f5f5f7;color:#555;padding:6px 2px;font-size:12px;font-weight:600;text-align:left}.day-title:hover{color:#0071e3}.entry{background:#fff;border:2px solid #e5e5ea;border-radius:12px;padding:10px;margin:8px 0}.entry.selected{border-color:#0071e3;background:#f5faff}.entry.locked{opacity:.45;background:#f0f0f2}.entry-head{display:flex;gap:10px;align-items:flex-start}.entry-info{min-width:180px;flex:1}.entry-time{font-size:12px;color:#86868b}.entry-title{font-size:13px;line-height:1.4;margin-top:4px;white-space:pre-wrap;max-height:54px;overflow:hidden}.entry-badge{font-size:11px;color:#86868b;white-space:nowrap}.media-strip{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.media{width:78px;height:78px;border-radius:8px;overflow:hidden;position:relative;background:#eee;border:2px solid transparent;padding:0}.media:hover{border-color:#0071e3}.media img{width:100%;height:100%;object-fit:cover;display:block}.media.video{display:flex;align-items:center;justify-content:center;background:#222;color:#fff;font-size:12px}.media .mark{position:absolute;right:3px;bottom:3px;background:#000b;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.media.anchor{border-color:#ff9500;box-shadow:0 0 0 2px #ff950044}.media.range{border-color:#0071e3}.entry-marker{font-size:11px;color:#0071e3;margin-top:7px}.entry-marker b{color:#ff9500}.compact .media:not(:first-child){display:none}.compact .media-strip{min-height:78px}
+.day{margin:14px 0}.day-title{position:sticky;top:calc(var(--top-height) + var(--tabs-height));z-index:4;display:block;width:100%;border:0;border-radius:0;background:#f5f5f7;color:#555;padding:6px 2px;font-size:12px;font-weight:600;text-align:left}.day-title:hover{color:#0071e3}.entry{background:#fff;border:2px solid #e5e5ea;border-radius:12px;padding:10px;margin:8px 0;cursor:pointer}.entry.selected{border-color:#0071e3;background:#f5faff}.entry.locked{opacity:.45;background:#f0f0f2}.entry-head{display:flex;gap:10px;align-items:flex-start}.entry-info{min-width:180px;flex:1}.entry-time{font-size:12px;color:#86868b}.entry-title{font-size:13px;line-height:1.4;margin-top:4px;white-space:pre-wrap;max-height:54px;overflow:hidden}.entry-badge{font-size:11px;color:#86868b;white-space:nowrap}.status{font-weight:600}.status-new{color:#0071e3}.status-updated{color:#ff9500}.status-failed{color:#c62828}.status-done{color:#86868b}.media-strip{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.media{width:78px;height:78px;border-radius:8px;overflow:hidden;position:relative;background:#eee;border:2px solid transparent;padding:0}.media:hover{border-color:#0071e3}.media img{width:100%;height:100%;object-fit:cover;display:block}.media.video{display:flex;align-items:center;justify-content:center;background:#222;color:#fff;font-size:12px}.media .mark{position:absolute;right:3px;bottom:3px;background:#000b;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.media.anchor{border-color:#ff9500;box-shadow:0 0 0 2px #ff950044}.media.range{border-color:#0071e3}.entry-marker{font-size:11px;color:#0071e3;margin-top:7px}.entry-marker b{color:#ff9500}.compact .media:not(:first-child){display:none}.compact .media-strip{min-height:78px}
 .side{position:sticky;top:calc(var(--top-height) + var(--tabs-height));align-self:start}.panel{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #e5e5ea}.panel h2{font-size:14px;margin:0 0 9px}.selection{font-size:12px;line-height:1.6;color:#555;min-height:48px}.selection strong{color:#1d1d1f}.count{font-size:12px;color:#0071e3;margin:8px 0}.draft{border-top:1px solid #e5e5ea;padding:9px 0;font-size:12px}.draft:first-of-type{border-top:0}.draft-title{font-weight:600}.draft-meta{color:#86868b;margin-top:3px}.empty{padding:40px 12px;text-align:center;color:#86868b;background:#fff;border-radius:12px}
 #media-hover-preview{display:none;position:fixed;z-index:100;pointer-events:none;width:min(560px,calc(100vw - 16px));height:min(640px,70vh);padding:8px;box-sizing:border-box;border-radius:10px;background:#111;box-shadow:0 12px 36px rgba(0,0,0,.35);align-items:center;justify-content:center}#media-hover-preview img,#media-hover-preview video{display:block;max-width:100%;max-height:100%;object-fit:contain}.media.video{color:#fff}.media.video img{position:absolute;inset:0}.video-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#000a;border-radius:16px;padding:5px 9px;font-size:11px;white-space:nowrap}
 @media(max-width:900px){.layout{grid-template-columns:1fr}.side{position:static}.day-title{top:calc(var(--top-height) + var(--tabs-height))}}
 </style></head><body>
 <header class="top" id="top"><div class="topline"><h1>📦 日常选品工作台</h1><span class="muted" id="capture"></span><span class="muted" id="summary"></span><label class="switch"><input id="history" type="checkbox"> 查看全部历史</label><label class="date-filter">日期<select id="dateFilter"><option value="">全部日期</option></select></label><button id="compact">显示全部图片</button><button id="supplierToggle" class="supplier-toggle" type="button" aria-expanded="true">收起供货商</button></div><div class="supplier-list" id="supplierList"></div></header>
-<main class="layout"><section class="timeline"><div class="tabs" id="tabs"></div><div id="entries"></div></section><aside class="side"><div class="panel"><h2>当前选择</h2><div class="selection" id="selection">先点击一张图作为起点</div><div class="count" id="rangeCount"></div><button class="primary" id="create" disabled>创建商品</button><button id="clear" style="margin-left:6px">清除选择</button></div><div class="panel"><h2>已创建商品 <span id="draftCount">0</span></h2><div id="drafts"><div class="muted">还没有创建商品</div></div><button class="danger" id="undo" disabled>撤销上一个商品</button><button class="primary" id="process" disabled style="margin-top:8px;width:100%">确认并开始处理</button></div></aside></main>
+<main class="layout"><section class="timeline"><div class="tabs" id="tabs"></div><div id="entries"></div></section><aside class="side"><div class="panel"><h2>当前选择</h2><div class="selection" id="selection">先点击一个条目作为起点</div><div class="count" id="rangeCount"></div><button class="primary" id="create" disabled>创建商品</button><button id="clear" style="margin-left:6px">清除选择</button></div><div class="panel"><h2>已创建商品 <span id="draftCount">0</span></h2><div id="drafts"><div class="muted">还没有创建商品</div></div><button class="danger" id="undo" disabled>撤销上一个商品</button><button class="primary" id="process" disabled style="margin-top:8px;width:100%">确认并开始处理</button></div></aside></main>
 <div id="media-hover-preview" aria-hidden="true"></div>
 <script>
 const DATA=__PAYLOAD__;
@@ -1239,11 +1350,14 @@ const items=()=>{const list=allCurrentItems();return state.date?list.filter(i=>i
 function syncLayoutOffsets(){document.documentElement.style.setProperty('--top-height',`${$('top').offsetHeight}px`);document.documentElement.style.setProperty('--tabs-height',`${$('tabs').offsetHeight}px`)}
 function init(){
   const first=DATA.find(s=>s.newCount>0)||DATA[0];state.active=first?.albumId||null;
-  $('capture').textContent=CAPTURE_TIME?`数据抓取时间：${CAPTURE_TIME}`:'数据抓取时间：未知';renderSuppliers();renderDateFilter();renderTabs();render();syncLayoutOffsets();
+  const captureTs=CAPTURE_TIME?Date.parse(CAPTURE_TIME.replace(' ','T')):NaN;const stale=captureTs&&!Number.isNaN(captureTs)&&Date.now()-captureTs>24*60*60*1000;$('capture').textContent=CAPTURE_TIME?(stale?`抓取状态：可能过期 · ${CAPTURE_TIME}`:`抓取状态：已成功 · ${CAPTURE_TIME}`):'抓取状态：未知';renderSuppliers();renderDateFilter();renderTabs();render();syncLayoutOffsets();
 }
 function renderDateFilter(){const dates=[...new Set(allCurrentItems().map(i=>i.workbenchDate).filter(Boolean))];$('dateFilter').innerHTML='<option value="">全部日期</option>'+dates.map(date=>`<option value="${esc(date)}">${esc(date)}</option>`).join('');$('dateFilter').value=state.date;}
+function statusLabel(status){return {new:'新增',updated:'已更新',failed:'处理失败',done:'已处理'}[status]||'待处理'}
+function statusSummary(s){const c=s.statusCounts||{};return [['new','新增'],['updated','更新'],['failed','失败']].filter(([key])=>c[key]).map(([key,label])=>`${label} ${c[key]}`).join(' · ')||'无待处理'}
+function captureSummary(s){if(s.captureOk===false)return `抓取失败${s.captureError?' · '+esc(s.captureError):''}`;if(s.captureOk===true)return `${statusSummary(s)} · 本次抓取成功`;return statusSummary(s)}
 function renderSuppliers(){
-  $('supplierList').innerHTML=DATA.map(s=>`<label class="${s.newCount?'active':''}"><input type="checkbox" data-aid="${esc(s.albumId)}" ${s.newCount?'checked':''}><span>${esc(s.supplier)}</span><small>${s.newCount?`新增 ${s.newCount}`:'无新增'}</small></label>`).join('');
+  $('supplierList').innerHTML=DATA.map(s=>`<label class="${s.newCount||s.captureOk===false?'active':''}"><input type="checkbox" data-aid="${esc(s.albumId)}" ${s.newCount||s.captureOk===false?'checked':''}><span>${esc(s.supplier)}</span><small>${captureSummary(s)}</small></label>`).join('');
   $('supplierList').querySelectorAll('input').forEach(input=>input.onchange=()=>{const selected=[...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid);if(!selected.includes(state.active))state.active=selected[0]||null;state.date='';renderDateFilter();renderTabs();render();});
 }
 function setSupplierOpen(open){state.supplierOpen=open;$('top').classList.toggle('collapsed',!open);$('supplierToggle').textContent=open?'收起供货商':'展开供货商';$('supplierToggle').setAttribute('aria-expanded',String(open));syncLayoutOffsets();}
@@ -1252,18 +1366,18 @@ window.addEventListener('scroll',()=>{const y=window.scrollY;if(y<=24)setSupplie
 function selectedSuppliers(){const ids=new Set([...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid));return DATA.filter(s=>ids.has(s.albumId))}
 function renderTabs(){const chosen=selectedSuppliers();if(!chosen.some(s=>s.albumId===state.active))state.active=chosen[0]?.albumId||null;$('tabs').innerHTML=chosen.map(s=>`<button class="tab ${s.albumId===state.active?'active':''}" data-aid="${esc(s.albumId)}">${esc(s.supplier)} · ${state.history?s.items.length:s.newCount}</button>`).join('');$('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{state.active=b.dataset.aid;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()});syncLayoutOffsets();}
 function mediaFor(item){return item.workbenchMedia||[]}
-function sameAnchor(a,b){return a&&b&&a.goodsId===b.goodsId&&a.mediaIndex===b.mediaIndex}
+function sameAnchor(a,b){return a&&b&&a.goodsId===b.goodsId}
 function currentRange(){const list=items(),s=state.selection;if(!s.start||!s.end)return null;const a=list.findIndex(i=>i.goods_id===s.start.goodsId),b=list.findIndex(i=>i.goods_id===s.end.goodsId);if(a<0||b<0)return null;const lo=Math.min(a,b),hi=Math.max(a,b);return {lo,hi,items:list.slice(lo,hi+1)};}
-function clickMedia(item,mediaIndex){
+function clickEntry(item){
   if(state.locked.has(item.goods_id))return;
-  const a={goodsId:item.goods_id,mediaIndex};
+  const a={goodsId:item.goods_id};
   if(!state.selection.start)state.selection.start=a;
   else if(!state.selection.end){if(sameAnchor(state.selection.start,a))state.selection={start:null,end:null};else state.selection.end=a}
   else if(sameAnchor(state.selection.start,a)||sameAnchor(state.selection.end,a))state.selection={start:null,end:null};
   else state.selection={start:a,end:null};
   render();
 }
-function mediaHTML(item,mi,m,range){const anchor=sameAnchor(state.selection.start,{goodsId:item.goods_id,mediaIndex:mi})||sameAnchor(state.selection.end,{goodsId:item.goods_id,mediaIndex:mi});const inRange=range&&range.items.some(i=>i.goods_id===item.goods_id);const cls=['media',m.type==='video'?'video':'',anchor?'anchor':'',inRange?'range':''].filter(Boolean).join(' ');const thumbUrl=m.thumb||(m.type==='video'?videoThumbFallback(m.url):thumbFallback(m.url));if(m.type==='video')return `<button type="button" class="${cls}" data-goods="${esc(item.goods_id)}" data-media="${mi}" title="悬停预览视频，点击选择"><img loading="lazy" decoding="async" src="${esc(thumbUrl)}"><span class="video-label">▶ 视频</span><span class="mark">${mi+1}</span></button>`;return `<button type="button" class="${cls}" data-goods="${esc(item.goods_id)}" data-media="${mi}" title="悬停查看大图，点击选择"><img loading="lazy" decoding="async" src="${esc(thumbUrl)}"><span class="mark">${mi+1}</span></button>`}
+function mediaHTML(item,mi,m,range){const inRange=range&&range.items.some(i=>i.goods_id===item.goods_id);const cls=['media',m.type==='video'?'video':'',inRange?'range':''].filter(Boolean).join(' ');const thumbUrl=m.thumb||(m.type==='video'?videoThumbFallback(m.url):thumbFallback(m.url));if(m.type==='video')return `<button type="button" class="${cls}" data-goods="${esc(item.goods_id)}" data-media="${mi}" title="悬停预览视频"><img loading="lazy" decoding="async" src="${esc(thumbUrl)}"><span class="video-label">▶ 视频</span><span class="mark">${mi+1}</span></button>`;return `<button type="button" class="${cls}" data-goods="${esc(item.goods_id)}" data-media="${mi}" title="悬停查看大图"><img loading="lazy" decoding="async" src="${esc(thumbUrl)}"><span class="mark">${mi+1}</span></button>`}
 function thumbFallback(url){const clean=String(url||'').split('?')[0];return clean+'?imageMogr2/thumbnail/!200x200r/quality/80'}
 function videoThumbFallback(url){const clean=String(url||'').split('?')[0];return clean+'?vframe/jpg/offset/0'}
 function hideMediaPreview(){const video=$('media-hover-preview').querySelector('video');if(video)video.pause();$('media-hover-preview').replaceChildren();$('media-hover-preview').style.display='none'}
@@ -1271,14 +1385,14 @@ function showMediaPreview(m,target){hideMediaPreview();if(!m||!m.url)return;cons
 function bindMediaHover(list){$('entries').querySelectorAll('.media').forEach(button=>{const item=list.find(i=>i.goods_id===button.dataset.goods),m=item&&mediaFor(item)[Number(button.dataset.media)];const show=()=>showMediaPreview(m,button),hide=()=>hideMediaPreview();button.addEventListener('mouseenter',show);button.addEventListener('mouseleave',hide);button.addEventListener('focus',show);button.addEventListener('blur',hide)})}
 function render(){
   hideMediaPreview();const s=current(),list=items(),range=currentRange();
-  $('summary').textContent=s?`${s.supplier} · ${state.history?list.length:`${list.length}/${s.items.length} 条新增`}`:'请先选择供货商';
+  $('summary').textContent=s?`${s.supplier} · ${state.history?`${list.length} 条历史`:statusSummary(s)}`:'请先选择供货商';
   $('entries').className=state.compact?'compact':'';
   if(!s||!list.length){$('entries').innerHTML='<div class="empty">当前没有可展示的内容</div>';renderSide(null);return}
-  let html='',lastDate='';list.forEach((item,index)=>{const date=item.workbenchDate||'';if(date!==lastDate){html+=`<div class="day"><button class="day-title" data-date="${esc(date)}" title="只看 ${esc(date)}">${esc(date)}</button>`;lastDate=date}const locked=state.locked.has(item.goods_id),inRange=range?.items.some(i=>i.goods_id===item.goods_id);const media=mediaFor(item);html+=`<article class="entry ${locked?'locked ':''}${inRange?'selected':''}"><div class="entry-head"><div class="entry-info"><div class="entry-time">${esc(item.workbenchTime||'时间未知')}</div><div class="entry-title">${esc(item.title||'(无文案)')}</div></div><div class="entry-badge">${media.length} 个素材${locked?' · 已创建':''}</div></div><div class="media-strip">${media.map((m,mi)=>mediaHTML(item,mi,m,range)).join('')}</div>${inRange?'<div class="entry-marker">已在当前范围内</div>':''}</article>`;const nextDate=list[index+1]?.workbenchDate;if(index===list.length-1||date!==nextDate)html+='</div>'});
-  $('entries').innerHTML=html;$('entries').querySelectorAll('.media').forEach(b=>b.onclick=()=>clickMedia(list.find(i=>i.goods_id===b.dataset.goods),Number(b.dataset.media)));bindMediaHover(list);$('entries').querySelectorAll('.day-title').forEach(b=>b.onclick=()=>{state.date=b.dataset.date;state.selection={start:null,end:null};renderDateFilter();render()});renderSide(range);
+  let html='',lastDate='';list.forEach((item,index)=>{const date=item.workbenchDate||'';if(date!==lastDate){html+=`<div class="day"><button class="day-title" data-date="${esc(date)}" title="只看 ${esc(date)}">${esc(date)}</button>`;lastDate=date}const locked=state.locked.has(item.goods_id),inRange=range?.items.some(i=>i.goods_id===item.goods_id);const media=mediaFor(item),status=item.workbenchStatus||'new';html+=`<article class="entry ${locked?'locked ':''}${inRange?'selected':''}" data-goods="${esc(item.goods_id)}"><div class="entry-head"><div class="entry-info"><div class="entry-time">${esc(item.workbenchTime||'时间未知')}</div><div class="entry-title">${esc(item.title||'(无文案)')}</div></div><div class="entry-badge">${media.length} 个素材 · <span class="status status-${status}">${statusLabel(status)}</span>${locked?' · 已创建':''}</div></div><div class="media-strip">${media.map((m,mi)=>mediaHTML(item,mi,m,range)).join('')}</div>${inRange?'<div class="entry-marker">已在当前范围内</div>':''}</article>`;const nextDate=list[index+1]?.workbenchDate;if(index===list.length-1||date!==nextDate)html+='</div>'});
+  $('entries').innerHTML=html;$('entries').querySelectorAll('.entry').forEach(article=>{const item=list.find(i=>i.goods_id===article.dataset.goods);article.onclick=()=>clickEntry(item)});$('entries').querySelectorAll('.media').forEach(b=>b.onclick=e=>e.stopPropagation());bindMediaHover(list);$('entries').querySelectorAll('.day-title').forEach(b=>b.onclick=()=>{state.date=b.dataset.date;state.selection={start:null,end:null};renderDateFilter();render()});renderSide(range);
 }
-function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 第${a.mediaIndex+1}个素材`};$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;$('drafts').innerHTML=state.drafts.length?state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join(''):'<div class="muted">还没有创建商品</div>'}
- $('supplierToggle').onclick=()=>{setSupplierOpen(!state.supplierOpen);lastScrollY=window.scrollY};$('dateFilter').onchange=()=>{state.date=$('dateFilter').value;state.selection={start:null,end:null};render()};$('history').onchange=()=>{state.history=$('history').checked;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()};$('compact').onclick=()=>{state.compact=!state.compact;$('compact').textContent=state.compact?'显示全部图片':'只显示首图';render()};$('clear').onclick=()=>{state.selection={start:null,end:null};render()};$('create').onclick=()=>{const r=currentRange(),s=current();if(!r||!s)return;const ids=r.items.map(i=>i.goods_id);if(ids.some(id=>state.locked.has(id)))return;const draft={supplier:s.supplier,albumId:s.albumId,items:r.items,index:state.drafts.filter(d=>d.albumId===s.albumId).length+1,label:`${ids[0]} → ${ids[ids.length-1]}`};state.drafts.push(draft);ids.forEach(id=>state.locked.add(id));state.selection={start:null,end:null};render()};$('undo').onclick=()=>{const d=state.drafts.pop();if(d)d.items.forEach(i=>state.locked.delete(i.goods_id));render()};$('process').onclick=()=>{const batch=state.drafts.slice();if(!batch.length)return;const grouped=[];const by=new Map();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,...raw}=i;return raw};batch.forEach(d=>{if(!by.has(d.albumId)){const value={supplier:d.supplier,albumId:d.albumId,groups:[]};by.set(d.albumId,value);grouped.push(value)}by.get(d.albumId).groups.push(d.items.map(cleanItem))});const blob=new Blob([JSON.stringify({suppliers:grouped},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`confirmed_groups_${Date.now()}.json`;a.click();state.drafts=[];state.selection={start:null,end:null};render();alert(`已提交 ${batch.length} 个商品，继续选择新商品即可提交下一批`);};init();
+ function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 条目`};$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;$('drafts').innerHTML=state.drafts.length?state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join(''):'<div class="muted">还没有创建商品</div>'}
+ $('supplierToggle').onclick=()=>{setSupplierOpen(!state.supplierOpen);lastScrollY=window.scrollY};$('dateFilter').onchange=()=>{state.date=$('dateFilter').value;state.selection={start:null,end:null};render()};$('history').onchange=()=>{state.history=$('history').checked;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()};$('compact').onclick=()=>{state.compact=!state.compact;$('compact').textContent=state.compact?'显示全部图片':'只显示首图';render()};$('clear').onclick=()=>{state.selection={start:null,end:null};render()};$('create').onclick=()=>{const r=currentRange(),s=current();if(!r||!s)return;const ids=r.items.map(i=>i.goods_id);if(ids.some(id=>state.locked.has(id)))return;const draft={supplier:s.supplier,albumId:s.albumId,items:r.items,index:state.drafts.filter(d=>d.albumId===s.albumId).length+1,label:`${ids[0]} → ${ids[ids.length-1]}`};state.drafts.push(draft);ids.forEach(id=>state.locked.add(id));state.selection={start:null,end:null};render()};$('undo').onclick=()=>{const d=state.drafts.pop();if(d)d.items.forEach(i=>state.locked.delete(i.goods_id));render()};$('process').onclick=()=>{const batch=state.drafts.slice();if(!batch.length)return;const grouped=[];const by=new Map();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,workbenchStatus,...raw}=i;return raw};batch.forEach(d=>{if(!by.has(d.albumId)){const value={supplier:d.supplier,albumId:d.albumId,groups:[]};by.set(d.albumId,value);grouped.push(value)}by.get(d.albumId).groups.push(d.items.map(cleanItem))});const blob=new Blob([JSON.stringify({suppliers:grouped},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`confirmed_groups_${Date.now()}.json`;a.click();state.drafts=[];state.selection={start:null,end:null};render();alert(`已提交 ${batch.length} 个商品，继续选择新商品即可提交下一批`);};init();
 </script></body></html>'''
     html = html.replace("__PAYLOAD__", payload).replace("__CAPTURE_TIME__", capture_payload)
     out_path.write_text(html, encoding="utf-8")
@@ -1480,12 +1594,15 @@ def cmd_preview(config, progress, data, code=""):
         print("  已在浏览器打开. 调整分组后点'确认并下载', 得到 confirmed_groups.json")
     except Exception:
         print(f"  请手动打开: {out}")
-    print(f"  然后运行: python3 pick_products.py process ~/Downloads/confirmed_groups.json")
+    print(f"  然后运行: python3 pick_products.py process data/confirmed_groups.json")
 
 
 def cmd_workbench(config, progress, data, scrape_path=""):
     """生成日常选品工作台: 默认新增, 可切换全部历史, 输出现有确认格式."""
+    before = json.dumps(progress, ensure_ascii=False, sort_keys=True)
     suppliers = _workbench_payload(data, progress)
+    if json.dumps(progress, ensure_ascii=False, sort_keys=True) != before:
+        save_json(PROGRESS_FILE, progress)
     if not suppliers:
         print("没有可展示的内容"); return False
     out = SCRIPT_DIR / "日常选品工作台.html"
@@ -1717,6 +1834,55 @@ def pick_newest_download(base):
     return dls[-1]
 
 
+def _project_json_paths(base):
+    data_dir = _project_data_dir()
+    if not data_dir.exists():
+        return []
+    return [
+        p for p in data_dir.iterdir()
+        if p.is_file() and p.suffix == ".json" and (
+            p.stem == base
+            or p.stem.startswith(f"{base} (")
+            or p.stem.startswith(f"{base}_")
+        )
+    ]
+
+
+def _latest_project_json(base):
+    paths = sorted(_project_json_paths(base), key=lambda p: p.stat().st_mtime)
+    return paths[-1] if paths else None
+
+
+def _archive_download(path):
+    """把 Chrome Downloads 中的 JSON 移入项目 data, 保留同名旧文件."""
+    source = Path(path)
+    data_dir = _project_data_dir()
+    if source.parent.resolve() == data_dir.resolve():
+        return source
+    if source.parent.resolve() != (Path.home() / "Downloads").resolve():
+        return source
+    data_dir.mkdir(parents=True, exist_ok=True)
+    target = data_dir / source.name
+    if target.exists():
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = data_dir / f"{source.stem}_{stamp}{source.suffix}"
+        index = 2
+        while target.exists():
+            target = data_dir / f"{source.stem}_{stamp}_{index}{source.suffix}"
+            index += 1
+    shutil.move(str(source), str(target))
+    return target
+
+
+def _latest_scrape_path():
+    """优先使用项目归档; 若旧文件仍在 Downloads, 首次使用时一并归档."""
+    project = _latest_project_json("scrape_all")
+    download = pick_newest_download("scrape_all")
+    if download and (project is None or download.stat().st_mtime > project.stat().st_mtime):
+        return _archive_download(download)
+    return project
+
+
 def _confirmed_download_paths(watch_dir):
     """找出工作台提交的 confirmed_groups 文件, 兼容旧名和带时间戳的新名."""
     pattern = re.compile(r"^confirmed_groups(?:_\d+)?(?: \(\d+\))?\.json$")
@@ -1727,8 +1893,8 @@ def ensure_data_for_date(
         scrape_path, config, supplier_name, date_str, timeout=240, code="",
         force_fetch=True, range_start="", range_end="", raise_interrupt=False):
     """前置: 确保 scrape 里有指定日期、编码或标题范围的完整数据. 必要时打开带 anchor 参数的 szwego,
-    让书签深挖. 监听 ~/Downloads 里 scrape_anchor.json (单供货商深挖) 或 scrape_all.json (全量) 出现,
-    merge 到本地 scrape_all.json 后再验证.
+    让书签深挖. 监听 Downloads 中转文件,收到后归档到项目 data/,
+    merge 到本地 scrape_all*.json 后再验证.
     """
     range_mode = bool(range_start and range_end)
     has_target = (lambda: _data_has_code(scrape_path, config, supplier_name, code)) if code else (
@@ -1802,7 +1968,8 @@ def ensure_data_for_date(
             if anchor_dl and anchor_is_new:
                 s1 = anchor_dl.stat().st_size; time.sleep(0.5)
                 if anchor_dl.stat().st_size != s1: continue
-                print(f"  ⇣ 收到深挖数据: {anchor_dl}")
+                anchor_dl = _archive_download(anchor_dl)
+                print(f"  ⇣ 收到深挖数据并归档: {anchor_dl}")
                 expected_aid = config.get("suppliers", {}).get(supplier_name)
                 if not expected_aid:
                     expected_aid = next((a for n, a in config.get("suppliers", {}).items()
@@ -1828,7 +1995,6 @@ def ensure_data_for_date(
                         print(f"  已保留诊断文件: {anchor_dl}")
                         return False
                 if _merge_anchor_into_scrape(scrape_path, anchor_dl):
-                    anchor_dl.unlink()  # 用完删掉
                     if range_mode:
                         print(f"✓ merge 后已找到 {target}")
                         return True
@@ -1847,6 +2013,8 @@ def ensure_data_for_date(
             if all_new and all_new.stat().st_mtime > all_dl_orig_mtime and all_new.stat().st_mtime > start_ts:
                 s1 = all_new.stat().st_size; time.sleep(0.5)
                 if all_new.stat().st_size != s1: continue
+                all_new = _archive_download(all_new)
+                scrape_path = str(all_new)
                 if code or range_mode:
                     label = "编码模式" if code else "标题范围模式"
                     print(f"⚠ {label}不接受普通单页抓取, 请点击当前深挖页面上的新版书签")
@@ -2087,8 +2255,9 @@ def refresh_daily_scrape(timeout=600):
     print("  已打开微购相册, Chrome 扩展应自动开始抓取")
     path = wait_for_fresh_download("scrape_all", before_mtime, timeout)
     if path:
+        path = _archive_download(path)
         captured = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  ✓ 数据抓取完成: {captured} ({path.name})")
+        print(f"  ✓ 数据抓取完成并归档: {captured} ({path})")
     else:
         print("  请确认扩展已加载、账号已登录, 或使用旧书签抓取")
     return path
@@ -2158,7 +2327,7 @@ def _write_chrome_extension(config, capture_script):
 3. 点击「加载已解压的扩展程序」，选择本目录。
 4. 登录微购相册后打开 `https://www.szwego.com/static/index.html`。
 
-扩展会自动抓取 `config.json` 中的供货商，并下载 `scrape_all.json`。
+扩展会自动抓取 `config.json` 中的供货商，并下载 `scrape_all.json` 到 Chrome 的 Downloads 中转目录。运行挑品脚本时会自动归档到项目 `data/`。
 供应商配置变化后，重新运行 `python3 pick_products.py extension`，再在扩展页点刷新。
 """,
         encoding="utf-8",
@@ -2246,10 +2415,10 @@ if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
   alert((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+target+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;
 }
-const out={data:{}};let ok=0,err=0;
+const out={data:{}};const capturedAt=new Date().toISOString();let ok=0,err=0;
 for(const [name,aid] of Object.entries(SUP)){
-  try{out.data[aid]={supplier:name,items:await fetchDaily(aid)};ok++;}
-  catch(e){out.data[aid]={supplier:name,items:[]};err++;}
+  try{out.data[aid]={supplier:name,items:await fetchDaily(aid),captured_at:capturedAt,capture_ok:true};ok++;}
+  catch(e){out.data[aid]={supplier:name,items:[],captured_at:capturedAt,capture_ok:false,capture_error:String(e)};err++;}
   await new Promise(r=>setTimeout(r,200));
 }
 dl(out,'scrape_all.json');
@@ -2279,7 +2448,7 @@ code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:13px}
 <ol>
 <li>登录微购相册 <code>https://www.szwego.com/static/index.html</code></li>
 <li>在书签栏点「🛒 抓挑品数据」</li>
-<li>自动下载 <code>scrape_all.json</code> 到 Downloads</li>
+<li>先自动下载 <code>scrape_all.json</code> 到 Chrome 的 Downloads 中转目录,脚本会归档到项目 <code>data/</code></li>
 <li>回终端跑 <code>python3 pick_products.py</code></li>
 </ol>
 </div>
@@ -2424,16 +2593,19 @@ def main():
         paths = [a for a in sys.argv[1:] if a.endswith(".json") and "config" not in a]
         if not paths:
             print("用法: python3 pick_products.py process <confirmed_groups.json>"); sys.exit(1)
-        cmd_process_confirmed(config, progress, paths[0]); return
+        confirmed_path = Path(paths[0])
+        if confirmed_path.parent.resolve() == (Path.home() / "Downloads").resolve():
+            confirmed_path = _archive_download(confirmed_path)
+        cmd_process_confirmed(config, progress, confirmed_path); return
 
-    default_scrape = Path.home() / "Downloads" / "scrape_all.json"
+    default_scrape = _project_data_dir() / "scrape_all.json"
     env_scrape = os.environ.get("SCRAPE_JSON")
     if mode == "range":
         try:
             targets = _parse_batch_targets("range", mode_args)
         except ValueError as e:
             print(f"用法错误: {e}"); sys.exit(1)
-        scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
+        scrape_path = env_scrape or str(_latest_scrape_path() or default_scrape)
         is_batch = len(targets) > 1
         results = []
         fetched_dates = set()
@@ -2519,7 +2691,7 @@ def main():
             targets = _parse_batch_targets("anchor", mode_args)
         except ValueError as e:
             print(f"用法错误: {e}"); sys.exit(1)
-        scrape_path = env_scrape or str(pick_newest_download("scrape_all") or default_scrape)
+        scrape_path = env_scrape or str(_latest_scrape_path() or default_scrape)
         is_batch = len(targets) > 1
         results = []
         fetched_dates = set()
@@ -2597,7 +2769,8 @@ def main():
         fresh = refresh_daily_scrape()
         scrape_path = str(fresh or "")
     else:
-        scrape_path = env_scrape or (str(pick_newest_download("scrape_all") or ""))
+        latest_scrape = _latest_scrape_path()
+        scrape_path = env_scrape or (str(latest_scrape) if latest_scrape else "")
     run_targets = []
     if mode == "run":
         run_targets = _parse_batch_targets("run", mode_args)
@@ -2723,6 +2896,7 @@ def main():
         if not confirmed:
             print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
             return
+        confirmed = _archive_download(confirmed)
         print(f"\n✓ 收到确认文件: {confirmed}, 开始处理...")
         cmd_process_confirmed(config, progress, str(confirmed))
         # 处理完把当前批次挪走, 避免下一轮误触.

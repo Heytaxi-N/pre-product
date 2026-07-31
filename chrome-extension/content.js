@@ -76,10 +76,10 @@ if(anchorSup&&(anchorDate||anchorCode||(rangeStart&&rangeEnd&&rangeDate))){
   console.log((incomplete?'深挖未完成':'深挖完成')+': '+name+' '+target+' 共 '+all.length+' 条 ('+pages+' 页)\n下载 scrape_anchor.json');
   return;
 }
-const out={data:{}};let ok=0,err=0;
+const out={data:{}};const capturedAt=new Date().toISOString();let ok=0,err=0;
 for(const [name,aid] of Object.entries(SUP)){
-  try{out.data[aid]={supplier:name,items:await fetchDaily(aid)};ok++;}
-  catch(e){out.data[aid]={supplier:name,items:[]};err++;}
+  try{out.data[aid]={supplier:name,items:await fetchDaily(aid),captured_at:capturedAt,capture_ok:true};ok++;}
+  catch(e){out.data[aid]={supplier:name,items:[],captured_at:capturedAt,capture_ok:false,capture_error:String(e)};err++;}
   await new Promise(r=>setTimeout(r,200));
 }
 dl(out,'scrape_all.json');

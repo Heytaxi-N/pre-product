@@ -80,6 +80,41 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn('id="media-hover-preview"', html)
         self.assertIn("videoThumbFallback", html)
         self.assertIn("mouseenter", html)
+        self.assertIn("先点击一个条目作为起点", html)
+        self.assertIn("function clickEntry", html)
+        self.assertNotIn("function clickMedia", html)
+
+    def test_payload_keeps_supplier_capture_failure(self):
+        payload = pick_products._workbench_payload(
+            {
+                "failed-album": {
+                    "supplier": "抓取失败供货商",
+                    "items": [],
+                    "capture_ok": False,
+                    "capture_error": "网络超时",
+                }
+            },
+            {},
+        )
+
+        self.assertEqual(1, len(payload))
+        self.assertFalse(payload[0]["captureOk"])
+        self.assertEqual("网络超时", payload[0]["captureError"])
+
+    def test_latest_scrape_archives_download_under_project_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            downloads = root / "Downloads"
+            downloads.mkdir()
+            source = downloads / "scrape_all.json"
+            source.write_text('{"data": {}}')
+
+            with patch.object(pick_products, "SCRIPT_DIR", root), \
+                    patch.object(Path, "home", return_value=root):
+                archived = pick_products._latest_scrape_path()
+                self.assertEqual(root / "data" / "scrape_all.json", archived)
+                self.assertTrue(archived.exists())
+                self.assertFalse(source.exists())
 
     def test_wait_for_confirmed_accepts_timestamped_download(self):
         with tempfile.TemporaryDirectory() as tmp:

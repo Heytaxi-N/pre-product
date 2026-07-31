@@ -18,6 +18,7 @@ paste_to_console.js
 scrape*.json
 captured_api.jsonl
 feishu_pending.json
+data/
 
 # Python 缓存
 __pycache__/
