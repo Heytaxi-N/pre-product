@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +84,48 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("先点击一个条目作为起点", html)
         self.assertIn("function clickEntry", html)
         self.assertNotIn("function clickMedia", html)
+        self.assertIn("scrollTick", html)
+        self.assertNotIn("if(y<=24)setSupplierOpen(true)", html)
+        self.assertIn("{jobs}", html)
+        self.assertIn("cancelled_job_", html)
+        self.assertIn("state.submitted", html)
+
+    def test_confirmed_jobs_expand_each_product(self):
+        jobs = pick_products._confirmed_jobs({
+            "suppliers": [{
+                "supplier": "测试供货商",
+                "albumId": "album",
+                "groups": [[{"goods_id": "one"}], [{"goods_id": "two"}]],
+            }]
+        })
+
+        self.assertEqual(["one", "two"], [job["items"][0]["goods_id"] for job in jobs])
+        self.assertEqual(2, len({job["jobId"] for job in jobs}))
+
+    def test_confirmed_jobs_accept_new_workbench_format(self):
+        jobs = pick_products._confirmed_jobs({
+            "jobs": [{"jobId": "job-1", "supplier": "小鱼", "albumId": "album", "items": [{"goods_id": "one"}]}]
+        })
+
+        self.assertEqual("job-1", jobs[0]["jobId"])
+        self.assertEqual("one", jobs[0]["items"][0]["goods_id"])
+
+    def test_process_confirmed_runs_jobs_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "confirmed_groups.json"
+            path.write_text(json.dumps({
+                "jobs": [
+                    {"jobId": "job-1", "supplier": "卓成", "albumId": "z", "items": [{"goods_id": "z1"}]},
+                    {"jobId": "job-2", "supplier": "小鱼", "albumId": "x", "items": [{"goods_id": "x1"}]},
+                ]
+            }))
+            with patch.object(pick_products, "process_groups", return_value=1) as process:
+                pick_products.cmd_process_confirmed({}, {}, path)
+
+        self.assertEqual(2, process.call_count)
+        self.assertEqual({"job-1", "job-2"}, {
+            call.kwargs["review_id"] for call in process.call_args_list
+        })
 
     def test_payload_keeps_supplier_capture_failure(self):
         payload = pick_products._workbench_payload(

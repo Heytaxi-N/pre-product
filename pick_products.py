@@ -5,7 +5,8 @@
   # 然后运行:
   SCRAPE_JSON=~/Downloads/scrape.json python3 pick_products.py
 """
-import json, os, sys, time, shutil, base64, hashlib, tempfile, re
+import json, os, sys, time, shutil, base64, hashlib, tempfile, re, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 import urllib.request, urllib.parse, urllib.error
@@ -20,6 +21,7 @@ MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 co
 BOOKMARKLET_FILE = SCRIPT_DIR / "install_bookmark.html"
 CHROME_EXTENSION_DIR = SCRIPT_DIR / "chrome-extension"
 GROUP_TIME_GAP = 120  # 秒: 帖子时间间隔 < 此值归为同一产品
+_PROGRESS_LOCK = threading.Lock()
 
 
 def _project_data_dir():
@@ -725,28 +727,30 @@ def filter_new_items(album_id, raw_items, progress):
 
 def _record_processed_ids(progress, album_id, groups, processed_ids):
     """记录实际成功落盘的帖子和当时版本, 避免部分失败被跳过."""
-    raw_items = [it for group in groups for it in group]
-    state = _ensure_progress_state(album_id, raw_items, progress)
-    versions = state["processed_versions"]
-    failed = state["failed_versions"]
-    by_id = {it.get("goods_id"): it for it in raw_items}
-    for gid in processed_ids:
-        if gid in by_id:
-            versions[gid] = _item_version(by_id[gid])
-            failed.pop(gid, None)
-    state["processed_ids"] = sorted(versions)
-    save_json(PROGRESS_FILE, progress)
+    with _PROGRESS_LOCK:
+        raw_items = [it for group in groups for it in group]
+        state = _ensure_progress_state(album_id, raw_items, progress)
+        versions = state["processed_versions"]
+        failed = state["failed_versions"]
+        by_id = {it.get("goods_id"): it for it in raw_items}
+        for gid in processed_ids:
+            if gid in by_id:
+                versions[gid] = _item_version(by_id[gid])
+                failed.pop(gid, None)
+        state["processed_ids"] = sorted(versions)
+        save_json(PROGRESS_FILE, progress)
 
 
 def _record_failed_ids(progress, album_id, items):
     """记录失败版本, 版本变化后会自动从 failed 变为 updated 重试."""
-    state = _ensure_progress_state(album_id, items, progress)
-    failed = state["failed_versions"]
-    for it in items:
-        gid = it.get("goods_id")
-        if gid:
-            failed[gid] = _item_version(it)
-    save_json(PROGRESS_FILE, progress)
+    with _PROGRESS_LOCK:
+        state = _ensure_progress_state(album_id, items, progress)
+        failed = state["failed_versions"]
+        for it in items:
+            gid = it.get("goods_id")
+            if gid:
+                failed[gid] = _item_version(it)
+        save_json(PROGRESS_FILE, progress)
 
 
 def _items_for_goods_ids(groups, goods_ids):
@@ -971,7 +975,7 @@ def _open_in_browser(path):
 
 def wait_for_classify_review(
         supplier_name, prepared, timeout=None, review_id="", review_label="",
-        raise_interrupt=False):
+        raise_interrupt=False, cancel_base=""):
     """弹排序预览, 等 分类确认.json。返回 orders(按 prepared 顺序的存活id列表)或 None。"""
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", review_id).strip("_")
     suffix = f"_{safe_id}" if safe_id else ""
@@ -994,6 +998,9 @@ def wait_for_classify_review(
     end = time.time() + timeout if timeout is not None else None
     try:
         while end is None or time.time() < end:
+            if cancel_base and _consume_cancel(cancel_base):
+                print("  已取消此商品, 未生成产品文件夹")
+                return None
             time.sleep(1)
             p = pick_newest_download(confirm_base)
             if p and p.stat().st_mtime > start:
@@ -1018,7 +1025,8 @@ def wait_for_classify_review(
 
 def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai_cfg,
                    advance_progress=True, review=None, order_key=_item_order,
-                   review_id="", review_label="", raise_interrupt=False):
+                   review_id="", review_label="", raise_interrupt=False,
+                   cancel_base=""):
     """按给定分组处理: 下载→去重→分类→排序→(可选拖拽/删图)→飞书→建文件夹. 返回产品数.
     advance_progress=False 时不推进按天进度(定向/批量下载用).
     review=None: 按环境变量 SKIP_REVIEW 决定, 默认弹排序预览。"""
@@ -1076,15 +1084,28 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
     if not prepared:
         return 0
 
+    if cancel_base and _consume_cancel(cancel_base):
+        for pr in prepared:
+            if pr["tmp_dir"].exists():
+                shutil.rmtree(pr["tmp_dir"], ignore_errors=True)
+        print("  已取消此商品, 未生成产品文件夹")
+        return 0
+
     # Phase A.5: 拖拽/删图/标尺码表 确认。edits 按 prepared 顺序, 每项 {order:[存活id], sizes:[标尺码表的id]}
     if review:
         if review_id or review_label or raise_interrupt:
-            edits = wait_for_classify_review(
-                supplier_name, prepared, review_id=review_id,
-                review_label=review_label, raise_interrupt=raise_interrupt,
-            )
+            review_args = {
+                "review_id": review_id,
+                "review_label": review_label,
+                "raise_interrupt": raise_interrupt,
+            }
+            if cancel_base:
+                review_args["cancel_base"] = cancel_base
+            edits = wait_for_classify_review(supplier_name, prepared, **review_args)
         else:
-            edits = wait_for_classify_review(supplier_name, prepared)
+            edits = (wait_for_classify_review(
+                supplier_name, prepared, cancel_base=cancel_base
+            ) if cancel_base else wait_for_classify_review(supplier_name, prepared))
         if edits is None:
             print("  未收到人工排序确认, 不生成任何产品文件夹")
             for pr in prepared:
@@ -1114,6 +1135,12 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
     n = 0
     feishu_pending = _load_feishu_pending() if feishu else {}
     for pr in prepared:
+        if cancel_base and _consume_cancel(cancel_base):
+            for pending in prepared:
+                if pending["tmp_dir"].exists():
+                    shutil.rmtree(pending["tmp_dir"], ignore_errors=True)
+            print("  已取消此商品, 未生成产品文件夹")
+            return 0
         final = pr["final"]
         if not final:
             print(f"\n─ 产品 {pr['gi']}: 图片被全部删除, 跳过")
@@ -1331,17 +1358,17 @@ button.danger{color:#c62828}.switch{display:inline-flex;gap:6px;align-items:cent
 .supplier-list label{display:inline-flex;align-items:center;gap:5px;background:#f5f5f7;border-radius:18px;padding:6px 10px;font-size:13px;cursor:pointer}.supplier-list label.active{background:#e8f2ff;color:#0066cc}
 .supplier-list small{color:#86868b}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;max-width:1500px;margin:0 auto;padding:14px}.timeline{min-width:0}.tabs{position:sticky;top:var(--top-height);z-index:12;display:flex;gap:6px;overflow:auto;padding:8px 0;background:#f5f5f7}.tab{white-space:nowrap}.tab.active{border-color:#0071e3;color:#0071e3;background:#e8f2ff}
 .day{margin:14px 0}.day-title{position:sticky;top:calc(var(--top-height) + var(--tabs-height));z-index:4;display:block;width:100%;border:0;border-radius:0;background:#f5f5f7;color:#555;padding:6px 2px;font-size:12px;font-weight:600;text-align:left}.day-title:hover{color:#0071e3}.entry{background:#fff;border:2px solid #e5e5ea;border-radius:12px;padding:10px;margin:8px 0;cursor:pointer}.entry.selected{border-color:#0071e3;background:#f5faff}.entry.locked{opacity:.45;background:#f0f0f2}.entry-head{display:flex;gap:10px;align-items:flex-start}.entry-info{min-width:180px;flex:1}.entry-time{font-size:12px;color:#86868b}.entry-title{font-size:13px;line-height:1.4;margin-top:4px;white-space:pre-wrap;max-height:54px;overflow:hidden}.entry-badge{font-size:11px;color:#86868b;white-space:nowrap}.status{font-weight:600}.status-new{color:#0071e3}.status-updated{color:#ff9500}.status-failed{color:#c62828}.status-done{color:#86868b}.media-strip{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.media{width:78px;height:78px;border-radius:8px;overflow:hidden;position:relative;background:#eee;border:2px solid transparent;padding:0}.media:hover{border-color:#0071e3}.media img{width:100%;height:100%;object-fit:cover;display:block}.media.video{display:flex;align-items:center;justify-content:center;background:#222;color:#fff;font-size:12px}.media .mark{position:absolute;right:3px;bottom:3px;background:#000b;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.media.anchor{border-color:#ff9500;box-shadow:0 0 0 2px #ff950044}.media.range{border-color:#0071e3}.entry-marker{font-size:11px;color:#0071e3;margin-top:7px}.entry-marker b{color:#ff9500}.compact .media:not(:first-child){display:none}.compact .media-strip{min-height:78px}
-.side{position:sticky;top:calc(var(--top-height) + var(--tabs-height));align-self:start}.panel{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #e5e5ea}.panel h2{font-size:14px;margin:0 0 9px}.selection{font-size:12px;line-height:1.6;color:#555;min-height:48px}.selection strong{color:#1d1d1f}.count{font-size:12px;color:#0071e3;margin:8px 0}.draft{border-top:1px solid #e5e5ea;padding:9px 0;font-size:12px}.draft:first-of-type{border-top:0}.draft-title{font-weight:600}.draft-meta{color:#86868b;margin-top:3px}.empty{padding:40px 12px;text-align:center;color:#86868b;background:#fff;border-radius:12px}
+.side{position:sticky;top:calc(var(--top-height) + var(--tabs-height));align-self:start}.panel{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #e5e5ea}.panel h2{font-size:14px;margin:0 0 9px}.selection{font-size:12px;line-height:1.6;color:#555;min-height:48px}.selection strong{color:#1d1d1f}.count{font-size:12px;color:#0071e3;margin:8px 0}.draft{border-top:1px solid #e5e5ea;padding:9px 0;font-size:12px}.draft:first-of-type{border-top:0}.draft-title{font-weight:600}.draft-meta{color:#86868b;margin-top:3px}.job-actions{margin-top:6px}.job-actions button{font-size:11px;padding:4px 8px}.empty{padding:40px 12px;text-align:center;color:#86868b;background:#fff;border-radius:12px}
 #media-hover-preview{display:none;position:fixed;z-index:100;pointer-events:none;width:min(560px,calc(100vw - 16px));height:min(640px,70vh);padding:8px;box-sizing:border-box;border-radius:10px;background:#111;box-shadow:0 12px 36px rgba(0,0,0,.35);align-items:center;justify-content:center}#media-hover-preview img,#media-hover-preview video{display:block;max-width:100%;max-height:100%;object-fit:contain}.media.video{color:#fff}.media.video img{position:absolute;inset:0}.video-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#000a;border-radius:16px;padding:5px 9px;font-size:11px;white-space:nowrap}
 @media(max-width:900px){.layout{grid-template-columns:1fr}.side{position:static}.day-title{top:calc(var(--top-height) + var(--tabs-height))}}
 </style></head><body>
 <header class="top" id="top"><div class="topline"><h1>📦 日常选品工作台</h1><span class="muted" id="capture"></span><span class="muted" id="summary"></span><label class="switch"><input id="history" type="checkbox"> 查看全部历史</label><label class="date-filter">日期<select id="dateFilter"><option value="">全部日期</option></select></label><button id="compact">显示全部图片</button><button id="supplierToggle" class="supplier-toggle" type="button" aria-expanded="true">收起供货商</button></div><div class="supplier-list" id="supplierList"></div></header>
-<main class="layout"><section class="timeline"><div class="tabs" id="tabs"></div><div id="entries"></div></section><aside class="side"><div class="panel"><h2>当前选择</h2><div class="selection" id="selection">先点击一个条目作为起点</div><div class="count" id="rangeCount"></div><button class="primary" id="create" disabled>创建商品</button><button id="clear" style="margin-left:6px">清除选择</button></div><div class="panel"><h2>已创建商品 <span id="draftCount">0</span></h2><div id="drafts"><div class="muted">还没有创建商品</div></div><button class="danger" id="undo" disabled>撤销上一个商品</button><button class="primary" id="process" disabled style="margin-top:8px;width:100%">确认并开始处理</button></div></aside></main>
+<main class="layout"><section class="timeline"><div class="tabs" id="tabs"></div><div id="entries"></div></section><aside class="side"><div class="panel"><h2>当前选择</h2><div class="selection" id="selection">先点击一个条目作为起点</div><div class="count" id="rangeCount"></div><button class="primary" id="create" disabled>创建商品</button><button id="clear" style="margin-left:6px">清除选择</button></div><div class="panel"><h2>商品队列 <span id="draftCount">0</span></h2><div id="drafts"><div class="muted">还没有创建商品</div></div><button class="danger" id="undo" disabled>撤销上一个草稿</button><button class="primary" id="process" disabled style="margin-top:8px;width:100%">确认并开始处理</button></div></aside></main>
 <div id="media-hover-preview" aria-hidden="true"></div>
 <script>
 const DATA=__PAYLOAD__;
 const CAPTURE_TIME=__CAPTURE_TIME__;
-const state={active:null,history:false,compact:true,supplierOpen:true,date:'',selection:{start:null,end:null},drafts:[],locked:new Set()};
+const state={active:null,history:false,compact:true,supplierOpen:true,date:'',selection:{start:null,end:null},drafts:[],submitted:[],locked:new Set()};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const current=()=>DATA.find(s=>s.albumId===state.active);
@@ -1360,9 +1387,9 @@ function renderSuppliers(){
   $('supplierList').innerHTML=DATA.map(s=>`<label class="${s.newCount||s.captureOk===false?'active':''}"><input type="checkbox" data-aid="${esc(s.albumId)}" ${s.newCount||s.captureOk===false?'checked':''}><span>${esc(s.supplier)}</span><small>${captureSummary(s)}</small></label>`).join('');
   $('supplierList').querySelectorAll('input').forEach(input=>input.onchange=()=>{const selected=[...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid);if(!selected.includes(state.active))state.active=selected[0]||null;state.date='';renderDateFilter();renderTabs();render();});
 }
-function setSupplierOpen(open){state.supplierOpen=open;$('top').classList.toggle('collapsed',!open);$('supplierToggle').textContent=open?'收起供货商':'展开供货商';$('supplierToggle').setAttribute('aria-expanded',String(open));syncLayoutOffsets();}
-let lastScrollY=0;
-window.addEventListener('scroll',()=>{const y=window.scrollY;if(y<=24)setSupplierOpen(true);else if(y>lastScrollY&&state.supplierOpen)setSupplierOpen(false);lastScrollY=y},{passive:true});
+function setSupplierOpen(open){if(state.supplierOpen===open)return;state.supplierOpen=open;$('top').classList.toggle('collapsed',!open);$('supplierToggle').textContent=open?'收起供货商':'展开供货商';$('supplierToggle').setAttribute('aria-expanded',String(open));syncLayoutOffsets();}
+let lastScrollY=window.scrollY,scrollTick=false;
+window.addEventListener('scroll',()=>{if(scrollTick)return;scrollTick=true;requestAnimationFrame(()=>{const y=window.scrollY;if(y>lastScrollY&&state.supplierOpen)setSupplierOpen(false);lastScrollY=y;scrollTick=false})},{passive:true});
 function selectedSuppliers(){const ids=new Set([...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid));return DATA.filter(s=>ids.has(s.albumId))}
 function renderTabs(){const chosen=selectedSuppliers();if(!chosen.some(s=>s.albumId===state.active))state.active=chosen[0]?.albumId||null;$('tabs').innerHTML=chosen.map(s=>`<button class="tab ${s.albumId===state.active?'active':''}" data-aid="${esc(s.albumId)}">${esc(s.supplier)} · ${state.history?s.items.length:s.newCount}</button>`).join('');$('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{state.active=b.dataset.aid;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()});syncLayoutOffsets();}
 function mediaFor(item){return item.workbenchMedia||[]}
@@ -1393,6 +1420,13 @@ function render(){
 }
  function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 条目`};$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;$('drafts').innerHTML=state.drafts.length?state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join(''):'<div class="muted">还没有创建商品</div>'}
  $('supplierToggle').onclick=()=>{setSupplierOpen(!state.supplierOpen);lastScrollY=window.scrollY};$('dateFilter').onchange=()=>{state.date=$('dateFilter').value;state.selection={start:null,end:null};render()};$('history').onchange=()=>{state.history=$('history').checked;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()};$('compact').onclick=()=>{state.compact=!state.compact;$('compact').textContent=state.compact?'显示全部图片':'只显示首图';render()};$('clear').onclick=()=>{state.selection={start:null,end:null};render()};$('create').onclick=()=>{const r=currentRange(),s=current();if(!r||!s)return;const ids=r.items.map(i=>i.goods_id);if(ids.some(id=>state.locked.has(id)))return;const draft={supplier:s.supplier,albumId:s.albumId,items:r.items,index:state.drafts.filter(d=>d.albumId===s.albumId).length+1,label:`${ids[0]} → ${ids[ids.length-1]}`};state.drafts.push(draft);ids.forEach(id=>state.locked.add(id));state.selection={start:null,end:null};render()};$('undo').onclick=()=>{const d=state.drafts.pop();if(d)d.items.forEach(i=>state.locked.delete(i.goods_id));render()};$('process').onclick=()=>{const batch=state.drafts.slice();if(!batch.length)return;const grouped=[];const by=new Map();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,workbenchStatus,...raw}=i;return raw};batch.forEach(d=>{if(!by.has(d.albumId)){const value={supplier:d.supplier,albumId:d.albumId,groups:[]};by.set(d.albumId,value);grouped.push(value)}by.get(d.albumId).groups.push(d.items.map(cleanItem))});const blob=new Blob([JSON.stringify({suppliers:grouped},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`confirmed_groups_${Date.now()}.json`;a.click();state.drafts=[];state.selection={start:null,end:null};render();alert(`已提交 ${batch.length} 个商品，继续选择新商品即可提交下一批`);};init();
+</script>
+<script>
+function downloadJson(name,value){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(value,null,2)],{type:'application/json'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+function cancelSubmitted(jobId){const job=state.submitted.find(item=>item.jobId===jobId);if(!job)return;downloadJson(`cancelled_job_${job.jobId}.json`,{jobId:job.jobId});state.submitted=state.submitted.filter(item=>item.jobId!==jobId);job.items.forEach(item=>state.locked.delete(item.goods_id));state.selection={start:null,end:null};render();alert('已撤销该商品，可以重新选择');}
+function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 条目`};const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length+state.submitted.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;const drafts=state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">待提交 · ${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join('');const submitted=state.submitted.map(job=>`<div class="draft"><div class="draft-title">${esc(job.supplier)} · ${esc(job.label||'商品')}</div><div class="draft-meta">处理中/等待分类预览 · ${job.items.length} 个条目</div><div class="job-actions"><button class="danger cancel-job" data-job="${esc(job.jobId)}">撤销并重新选择</button></div></div>`).join('');$('drafts').innerHTML=drafts+submitted||( '<div class="muted">还没有创建商品</div>');$('drafts').querySelectorAll('.cancel-job').forEach(button=>button.onclick=()=>cancelSubmitted(button.dataset.job));}
+$('process').onclick=()=>{const batch=state.drafts.slice();if(!batch.length)return;const stamp=Date.now();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,workbenchStatus,...raw}=i;return raw};const jobs=batch.map((d,index)=>({jobId:`${stamp}_${index+1}`,supplier:d.supplier,albumId:d.albumId,label:`${d.supplier} · 商品 ${d.index}`,items:d.items.map(cleanItem)}));downloadJson(`confirmed_groups_${stamp}.json`,{jobs});state.submitted.push(...jobs);state.drafts=[];state.selection={start:null,end:null};render();alert(`已提交 ${jobs.length} 个商品，分类预览可同时生成；如需重选，可在商品队列中撤销`);};
+render();
 </script></body></html>'''
     html = html.replace("__PAYLOAD__", payload).replace("__CAPTURE_TIME__", capture_payload)
     out_path.write_text(html, encoding="utf-8")
@@ -2200,18 +2234,74 @@ def cmd_title_range(
     return n
 
 
-def cmd_process_confirmed(config, progress, confirmed_path):
-    """按确认后的分组处理."""
-    confirmed = json.loads(Path(confirmed_path).read_text())
+def _safe_job_id(job_id):
+    return re.sub(r"[^0-9A-Za-z_-]", "_", str(job_id)).strip("_")
+
+
+def _consume_cancel(cancel_base):
+    """消费一个 Chrome 取消文件; 每个任务 ID 唯一, 不会误取消旧任务."""
+    path = pick_newest_download(cancel_base)
+    if not path:
+        return False
+    try:
+        _archive_download(path)
+    except Exception:
+        pass
+    return True
+
+
+def _confirmed_jobs(confirmed):
+    """兼容旧 suppliers 格式, 新格式按商品拆成独立任务."""
+    jobs = confirmed.get("jobs")
+    if jobs:
+        return jobs
+    result = []
+    stamp = time.time_ns()
+    for sup in confirmed.get("suppliers", []):
+        for index, group in enumerate(sup.get("groups", []), 1):
+            result.append({
+                "jobId": f"legacy_{stamp}_{len(result)}",
+                "supplier": sup["supplier"],
+                "albumId": sup["albumId"],
+                "items": group,
+                "label": f"{sup['supplier']} · 商品 {index}",
+            })
+    return result
+
+
+def _process_confirmed_job(config, progress, job):
+    supplier = job["supplier"]
+    album_id = job["albumId"]
+    job_id = _safe_job_id(job.get("jobId") or f"{album_id}_{time.time_ns()}")
+    label = job.get("label") or f"{supplier} · 商品"
     fs_cfg = config.get("feishu") or {}
     feishu = Feishu(fs_cfg) if fs_cfg.get("app_id") and fs_cfg.get("base_id") else None
     ai_cfg = config.get("ai_vision") or {}
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n{'='*50}\n处理任务: {label}")
+    return process_groups(
+        supplier, album_id, [job["items"]], progress, feishu, fs_cfg, ai_cfg,
+        review_id=job_id, review_label=label,
+        cancel_base=f"cancelled_job_{job_id}",
+    )
+
+
+def cmd_process_confirmed(config, progress, confirmed_path):
+    """按独立商品任务并行处理, 每个任务拥有自己的分类预览和取消文件."""
+    confirmed = json.loads(Path(confirmed_path).read_text())
+    jobs = _confirmed_jobs(confirmed)
+    if not jobs:
+        print("没有可处理的商品任务")
+        return
     total = 0
-    for sup in confirmed["suppliers"]:
-        print(f"\n{'='*50}\n处理供货商: {sup['supplier']} ({len(sup['groups'])} 个产品)")
-        total += process_groups(sup["supplier"], sup["albumId"], sup["groups"],
-                                progress, feishu, fs_cfg, ai_cfg)
+    workers = min(8, len(jobs))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="product") as pool:
+        futures = [pool.submit(_process_confirmed_job, config, progress, job) for job in jobs]
+        for future in as_completed(futures):
+            try:
+                total += future.result()
+            except Exception as e:
+                print(f"⚠ 商品任务失败: {e}")
     print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
 
 
@@ -2289,6 +2379,16 @@ def wait_for_confirmed(watch_dir=None, timeout=None):
     except KeyboardInterrupt:
         print("\n已取消等待"); return None
     print("\n⚠ 超时未收到确认文件"); return None
+
+
+def _process_confirmed_file(config, progress, confirmed):
+    try:
+        cmd_process_confirmed(config, progress, str(confirmed))
+    finally:
+        try:
+            confirmed.rename(confirmed.with_suffix(".done.json"))
+        except Exception:
+            pass
 
 
 def _load_all_supplier_ids(config):
@@ -2890,20 +2990,19 @@ def main():
     if mode == "preview":
         return   # 显式 preview: 只生成预览, 不等待
 
-    # 合并流程: 每批处理完成后继续等待下一批, 直到 Ctrl+C.
-    while True:
-        confirmed = wait_for_confirmed()
-        if not confirmed:
-            print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
-            return
-        confirmed = _archive_download(confirmed)
-        print(f"\n✓ 收到确认文件: {confirmed}, 开始处理...")
-        cmd_process_confirmed(config, progress, str(confirmed))
-        # 处理完把当前批次挪走, 避免下一轮误触.
-        try:
-            confirmed.rename(confirmed.with_suffix(".done.json"))
-        except Exception:
-            pass
+    # 合并流程: 处理任务在后台运行, 主线程继续监听后续提交批次.
+    executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="batch")
+    try:
+        while True:
+            confirmed = wait_for_confirmed()
+            if not confirmed:
+                print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
+                return
+            confirmed = _archive_download(confirmed)
+            print(f"\n✓ 收到确认文件: {confirmed}, 已加入并行处理队列...")
+            executor.submit(_process_confirmed_file, config, progress, confirmed)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

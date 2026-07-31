@@ -61,16 +61,20 @@ python3 pick_products.py
 2. 打开「日常选品工作台.html」，默认勾选有新增内容的供货商
 3. 按时间查看条目，点击起点条目和终点条目；系统会包含首尾条目及中间条目，图片和视频只负责预览
 4. 点击「创建商品」加入商品队列；同一张图再次点击可取消，已创建范围会锁定
-5. 全部选完后点「确认并开始处理」，生成现有格式的 `confirmed_groups.json`，脚本自动归档到项目 `data/`
-6. 脚本自动接收确认文件 → 下载图 → 去重 → AI 分类排序
-7. 复用「排序预览.html」→ 你**拖拽调序 / 删图 / 标尺码表**(可选)→ 点「完成并生成」
-8. 脚本自动接收 `分类确认.json` 并归档到项目 `data/` → 写飞书 → 建文件夹
+5. 全部选完后点「确认并开始处理」，每个商品生成独立任务，确认文件自动归档到项目 `data/`
+6. 脚本持续监听后续提交；不同商品会独立下载、去重、AI 分类并生成各自的「排序预览」
+7. 你可以同时处理多个供货商的分类预览；每个预览使用独立确认文件，互不阻塞
+8. 在商品队列中可对排队中或等待分类的商品点「撤销并重新选择」，条目会解锁并可重新创建
+9. 复用「排序预览.html」→ 你**拖拽调序 / 删图 / 标尺码表**(可选)→ 点「完成并生成」
+10. 脚本自动接收 `分类确认.json` 并归档到项目 `data/` → 写飞书 → 建文件夹
 
 工作台支持：
 - 多选供货商，按供货商独立切换；默认只看上次成功处理后的新增内容，也可勾选「查看全部历史」。
 - 新增判断按 `goods_id + 内容版本`，可识别同一条目后续修改；工作台区分「新增 / 已更新 / 处理失败 / 已处理」，旧日期进度会自动迁移。
 - 抓取时间超过 24 小时会标记为「可能过期」，避免把旧快照误认为供货商当前状态。
 - 默认每条只显示首图；需要时点击「显示全部图片」，所有图片使用懒加载。视频显示为 `🎬 视频`，也可作为起止选择点。
+- 商品提交后会保留在商品队列；分类预览等待期间仍可继续选择并提交其他供货商的商品。要重新选择时，点击对应商品的「撤销并重新选择」。
+- 需要保持运行 `python3 pick_products.py` 的终端，脚本会持续监听新的商品任务；关闭终端不会丢失已下载的确认 JSON，重新运行后仍可继续处理。
 - `python3 pick_products.py preview` 仍保留旧的 AI 分组预览入口。
 
 整个过程零环境变量、零路径粘贴。两个网页(分组预览、排序预览)都自动弹出,不想动就直接关掉走默认。
@@ -158,7 +162,7 @@ python3 pick_products.py range \
 - `python3 pick_products.py range <供货商> <日期> <起始标题> <结束标题> [...]` — 每 4 项一组
 - `python3 pick_products.py process <confirmed.json>` — 只处理已确认的分组文件
 
-环境变量:`SUPPLIERS=`、`CODE=`、`MAX_PRODUCTS=`、`SCRAPE_JSON=`。Chrome 的 Downloads 只是中转目录；脚本运行期间收到的 `scrape_all`、`scrape_anchor`、`confirmed_groups`、`分类确认` 都会归档到项目 `data/`，后续默认从这里读取。
+环境变量:`SUPPLIERS=`、`CODE=`、`MAX_PRODUCTS=`、`SCRAPE_JSON=`。Chrome 的 Downloads 只是中转目录；脚本运行期间收到的 `scrape_all`、`scrape_anchor`、`confirmed_groups`、`分类确认`、`cancelled_job` 都会归档到项目 `data/`，后续默认从这里读取。
 
 ### 书签点了没反应?兜底方案
 
@@ -176,7 +180,7 @@ python3 pick_products.py range \
 
 产品文件夹默认建在 `/Users/nick/Downloads/weidian_products-main/商品图/`(在 `pick_products.py` 顶部 `OUTPUT_DIR` 改)。每个文件夹只含编号好的图片(文案已写入飞书表格,不再另存 `文案.txt`)。临时/缓存文件放系统临时目录,不污染输出目录。
 
-抓取和确认用的 JSON 会归档在项目 `data/`：`scrape_all*.json`、`scrape_anchor*.json`、`confirmed_groups*.json`、`分类确认*.json`。Chrome 的 Downloads 只负责中转，脚本收到文件后会移动到这里；即使清理 Downloads，项目数据仍保留。
+抓取和确认用的 JSON 会归档在项目 `data/`：`scrape_all*.json`、`scrape_anchor*.json`、`confirmed_groups*.json`、`分类确认*.json`、`cancelled_job*.json`。Chrome 的 Downloads 只负责中转，脚本收到文件后会移动到这里；即使清理 Downloads，项目数据仍保留。
 
 ## 文件
 
