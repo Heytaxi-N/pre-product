@@ -25,10 +25,12 @@ class BookmarkletTests(unittest.TestCase):
             tmp_path = Path(tmp)
             original_file = pick_products.BOOKMARKLET_FILE
             original_dir = pick_products.SCRIPT_DIR
+            original_extension_dir = pick_products.CHROME_EXTENSION_DIR
             original_open = webbrowser.open
             try:
                 pick_products.BOOKMARKLET_FILE = tmp_path / "install_bookmark.html"
                 pick_products.SCRIPT_DIR = tmp_path
+                pick_products.CHROME_EXTENSION_DIR = tmp_path / "chrome-extension"
                 webbrowser.open = lambda *args, **kwargs: True
 
                 pick_products.cmd_install_bookmark(
@@ -59,9 +61,13 @@ class BookmarkletTests(unittest.TestCase):
                 self.assertIn("const fetchDaily=async aid=>", body)
                 self.assertIn("const DAILY_MAX=50", body)
                 self.assertIn("foundLatest&&misses>=2", body)
+                self.assertIn("const rawLatestDate=raw.map(itemDate).sort().pop()", body)
+                self.assertIn("raw.some(i=>itemDate(i)===latestDate)", body)
                 self.assertIn("items:await fetchDaily(aid)", body)
                 self.assertNotIn("const d=await fetchOne(aid,'');out.data", body)
                 self.assertIn("const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id)", body)
+                self.assertIn("const dailyClean=arr=>arr.filter(i=>!i.isTop).map(clean)", body)
+                self.assertIn("const items=dailyClean(raw)", body)
                 self.assertIn("(anchorDate||rangeStart)?anchorClean(rawItems):filt(rawItems)", body)
                 self.assertIn("const anchorClean=arr=>arr.filter(i=>!i.isTop).map(clean)", body)
                 self.assertNotIn("const anchorClean=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime)", body)
@@ -98,6 +104,7 @@ class BookmarkletTests(unittest.TestCase):
             finally:
                 pick_products.BOOKMARKLET_FILE = original_file
                 pick_products.SCRIPT_DIR = original_dir
+                pick_products.CHROME_EXTENSION_DIR = original_extension_dir
                 webbrowser.open = original_open
 
 

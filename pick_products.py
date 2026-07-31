@@ -2443,6 +2443,7 @@ def cmd_install_bookmark(config, open_install=True):
 const SUP=__SUPPLIERS__;
 const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,update_time:it.update_time,videoUrl:it.videoUrl||it.videoURL||''});
 const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id).map(clean);
+const dailyClean=arr=>arr.filter(i=>!i.isTop).map(clean);
 const anchorClean=arr=>arr.filter(i=>!i.isTop).map(clean);
 const itemDate=it=>{const d=new Date(it.time_stamp),p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
 const fetchOne=async(aid,pageTs)=>{
@@ -2455,9 +2456,10 @@ const fetchDaily=async aid=>{
     const d=await fetchOne(aid,pageTs);
     const raw=d.result&&d.result.items?d.result.items:[];
     if(raw.length===0)break;
-    const items=filt(raw);
-    if(!latestDate&&items.length)latestDate=items.map(itemDate).sort().pop();
-    const hasLatest=!!latestDate&&items.some(i=>itemDate(i)===latestDate);
+    const items=dailyClean(raw);
+    const rawLatestDate=raw.map(itemDate).sort().pop();
+    if(!latestDate&&rawLatestDate)latestDate=rawLatestDate;
+    const hasLatest=!!latestDate&&raw.some(i=>itemDate(i)===latestDate);
     if(hasLatest){foundLatest=true;misses=0;}else if(foundLatest){misses++;}
     for(const it of items){if(!seen.has(it.goods_id)){seen.add(it.goods_id);all.push(it);}}
     pages++;
