@@ -105,11 +105,37 @@ class DailyReliabilityTests(unittest.TestCase):
             pick_products._progress_item_status(changed, progress["album-1"]),
         )
 
+    def test_read_version_is_hidden_until_the_item_changes(self):
+        item = make_item("read", update_minute=1)
+        changed = make_item("read", update_minute=2, title="看过后更新")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            pick_products, "PROGRESS_FILE", Path(tmp) / "progress.json"
+        ):
+            progress = {}
+            pick_products._record_read_items(
+                progress, [{"albumId": "album-1", "items": [item]}]
+            )
+            self.assertEqual(
+                "read", pick_products._progress_item_status(item, progress["album-1"])
+            )
+            self.assertEqual([], pick_products.filter_new_items("album-1", [item], progress))
+            self.assertEqual(
+                "updated",
+                pick_products._progress_item_status(changed, progress["album-1"]),
+            )
+            self.assertEqual(
+                ["read"],
+                [item["goods_id"] for item in pick_products.filter_new_items(
+                    "album-1", [changed], progress
+                )],
+            )
+
     def test_workbench_marks_new_updated_failed_and_done(self):
         done = make_item("done", update_minute=1)
         changed = make_item("changed", update_minute=2)
         failed = make_item("failed", update_minute=3)
         new = make_item("new", update_minute=4)
+        read = make_item("read", update_minute=5)
         progress = {
             "album-1": {
                 "cutoff_date": "2026-07-24",
@@ -121,11 +147,14 @@ class DailyReliabilityTests(unittest.TestCase):
                 "failed_versions": {
                     "failed": pick_products._item_version(failed),
                 },
+                "read_versions": {
+                    "read": pick_products._item_version(read),
+                },
             }
         }
 
         payload = pick_products._workbench_payload(
-            {"album-1": {"supplier": "测试供货商", "items": [done, changed, failed, new]}},
+            {"album-1": {"supplier": "测试供货商", "items": [done, changed, failed, new, read]}},
             progress,
         )
         statuses = {
@@ -133,9 +162,10 @@ class DailyReliabilityTests(unittest.TestCase):
             for item in payload[0]["items"]
         }
         self.assertEqual(
-            {"done": "done", "changed": "updated", "failed": "failed", "new": "new"},
+            {"done": "done", "changed": "updated", "failed": "failed", "new": "new", "read": "read"},
             statuses,
         )
+        self.assertEqual(3, payload[0]["pendingCount"])
 
     def test_process_groups_records_only_successful_goods_ids(self):
         success = make_item("success")

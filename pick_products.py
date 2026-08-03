@@ -660,6 +660,7 @@ def _new_progress_state(cutoff_date=""):
         "processed_ids": [],
         "processed_versions": {},
         "failed_versions": {},
+        "read_versions": {},
     }
 
 
@@ -691,6 +692,7 @@ def _ensure_progress_state(album_id, raw_items, progress):
         state.setdefault("processed_ids", [])
         state.setdefault("processed_versions", {})
         state.setdefault("failed_versions", {})
+        state.setdefault("read_versions", {})
         processed_versions = state["processed_versions"]
         for gid in state["processed_ids"]:
             if gid not in processed_versions and gid in by_id:
@@ -710,11 +712,14 @@ def _progress_item_status(it, state):
     version = _item_version(it)
     processed_versions = state.get("processed_versions") or {}
     failed_versions = state.get("failed_versions") or {}
+    read_versions = state.get("read_versions") or {}
     if processed_versions.get(gid) == version:
         return "done"
+    if read_versions.get(gid) == version:
+        return "read"
     if failed_versions.get(gid) == version:
         return "failed"
-    if gid in processed_versions or gid in failed_versions:
+    if gid in processed_versions or gid in failed_versions or gid in read_versions:
         return "updated"
     return "new"
 
@@ -722,7 +727,10 @@ def _progress_item_status(it, state):
 def filter_new_items(album_id, raw_items, progress):
     """返回未成功处理或版本已变化的条目, 兼容旧日期进度."""
     state = _ensure_progress_state(album_id, raw_items, progress)
-    return [it for it in raw_items if _progress_item_status(it, state) != "done"]
+    return [
+        it for it in raw_items
+        if _progress_item_status(it, state) not in ("done", "read")
+    ]
 
 
 def _record_processed_ids(progress, album_id, groups, processed_ids):
@@ -732,11 +740,13 @@ def _record_processed_ids(progress, album_id, groups, processed_ids):
         state = _ensure_progress_state(album_id, raw_items, progress)
         versions = state["processed_versions"]
         failed = state["failed_versions"]
+        read = state["read_versions"]
         by_id = {it.get("goods_id"): it for it in raw_items}
         for gid in processed_ids:
             if gid in by_id:
                 versions[gid] = _item_version(by_id[gid])
                 failed.pop(gid, None)
+                read.pop(gid, None)
         state["processed_ids"] = sorted(versions)
         save_json(PROGRESS_FILE, progress)
 
@@ -750,6 +760,23 @@ def _record_failed_ids(progress, album_id, items):
             gid = it.get("goods_id")
             if gid:
                 failed[gid] = _item_version(it)
+        save_json(PROGRESS_FILE, progress)
+
+
+def _record_read_items(progress, reads):
+    """记录用户明确看过的条目版本;内容变化后自动重新进入待处理."""
+    with _PROGRESS_LOCK:
+        for read in reads:
+            album_id = read.get("albumId")
+            items = read.get("items") or []
+            if not album_id or not items:
+                continue
+            state = _ensure_progress_state(album_id, items, progress)
+            versions = state["read_versions"]
+            for item in items:
+                gid = item.get("goods_id")
+                if gid:
+                    versions[gid] = _item_version(item)
         save_json(PROGRESS_FILE, progress)
 
 
@@ -1297,7 +1324,7 @@ def _workbench_item(item):
 
 
 def _workbench_payload(data, progress):
-    """工作台数据: 新增内容与全部历史同时提供, 默认只展示新增内容."""
+    """工作台数据: 待处理内容与全部历史同时提供, 默认只展示待处理内容."""
     suppliers = []
     for aid, bucket in data.items():
         all_items = sorted(
@@ -1313,8 +1340,9 @@ def _workbench_payload(data, progress):
             item.get("goods_id"): _progress_item_status(item, state)
             for item in all_items
         }
-        new_ids = {
-            gid for gid, status in statuses.items() if status != "done"
+        pending_statuses = {"new", "updated", "failed"}
+        pending_ids = {
+            gid for gid, status in statuses.items() if status in pending_statuses
         }
         status_counts = {
             status: sum(1 for value in statuses.values() if value == status)
@@ -1324,14 +1352,14 @@ def _workbench_payload(data, progress):
         for item in all_items:
             value = _workbench_item(item)
             value["workbenchStatus"] = statuses.get(item.get("goods_id"), "new")
-            value["_new"] = value["workbenchStatus"] != "done"
+            value["_new"] = value["workbenchStatus"] in pending_statuses
             value["workbenchDate"] = _workbench_datetime(item).strftime("%m/%d")
             value["workbenchTime"] = _workbench_datetime(item).strftime("%m/%d %H:%M")
             workbench_items.append(value)
         suppliers.append({
             "supplier": bucket.get("supplier", aid[-8:]),
             "albumId": aid,
-            "newCount": len(new_ids),
+            "pendingCount": len(pending_ids),
             "statusCounts": status_counts,
             "captureOk": capture_ok,
             "captureAt": bucket.get("captured_at", ""),
@@ -1357,12 +1385,12 @@ button.primary{background:#0071e3;color:#fff;border-color:#0071e3;font-weight:60
 button.danger{color:#c62828}.switch{display:inline-flex;gap:6px;align-items:center;font-size:13px}.supplier-list{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;max-height:2000px;overflow:hidden;opacity:1}.top.collapsed .supplier-list{max-height:0;margin-top:0;opacity:0;pointer-events:none}.top.collapsed .supplier-toggle{display:inline-flex}
 .supplier-list label{display:inline-flex;align-items:center;gap:5px;background:#f5f5f7;border-radius:18px;padding:6px 10px;font-size:13px;cursor:pointer}.supplier-list label.active{background:#e8f2ff;color:#0066cc}
 .supplier-list small{color:#86868b}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;max-width:1500px;margin:0 auto;padding:14px}.timeline{min-width:0}.tabs{position:sticky;top:var(--top-height);z-index:12;display:flex;gap:6px;overflow:auto;padding:8px 0;background:#f5f5f7}.tab{white-space:nowrap}.tab.active{border-color:#0071e3;color:#0071e3;background:#e8f2ff}
-.day{margin:14px 0}.day-title{position:sticky;top:calc(var(--top-height) + var(--tabs-height));z-index:4;display:block;width:100%;border:0;border-radius:0;background:#f5f5f7;color:#555;padding:6px 2px;font-size:12px;font-weight:600;text-align:left}.day-title:hover{color:#0071e3}.entry{background:#fff;border:2px solid #e5e5ea;border-radius:12px;padding:10px;margin:8px 0;cursor:pointer}.entry.selected{border-color:#0071e3;background:#f5faff}.entry.locked{opacity:.45;background:#f0f0f2}.entry-head{display:flex;gap:10px;align-items:flex-start}.entry-info{min-width:180px;flex:1}.entry-time{font-size:12px;color:#86868b}.entry-title{font-size:13px;line-height:1.4;margin-top:4px;white-space:pre-wrap;max-height:54px;overflow:hidden}.entry-badge{font-size:11px;color:#86868b;white-space:nowrap}.status{font-weight:600}.status-new{color:#0071e3}.status-updated{color:#ff9500}.status-failed{color:#c62828}.status-done{color:#86868b}.media-strip{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.media{width:78px;height:78px;border-radius:8px;overflow:hidden;position:relative;background:#eee;border:2px solid transparent;padding:0}.media:hover{border-color:#0071e3}.media img{width:100%;height:100%;object-fit:cover;display:block}.media.video{display:flex;align-items:center;justify-content:center;background:#222;color:#fff;font-size:12px}.media .mark{position:absolute;right:3px;bottom:3px;background:#000b;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.media.anchor{border-color:#ff9500;box-shadow:0 0 0 2px #ff950044}.media.range{border-color:#0071e3}.entry-marker{font-size:11px;color:#0071e3;margin-top:7px}.entry-marker b{color:#ff9500}.compact .media:not(:first-child){display:none}.compact .media-strip{min-height:78px}
+.day{margin:14px 0}.day-title{position:sticky;top:calc(var(--top-height) + var(--tabs-height));z-index:4;display:block;width:100%;border:0;border-radius:0;background:#f5f5f7;color:#555;padding:6px 2px;font-size:12px;font-weight:600;text-align:left}.day-title:hover{color:#0071e3}.entry{background:#fff;border:2px solid #e5e5ea;border-radius:12px;padding:10px;margin:8px 0;cursor:pointer}.entry.selected{border-color:#0071e3;background:#f5faff}.entry.locked{opacity:.45;background:#f0f0f2}.entry-head{display:flex;gap:10px;align-items:flex-start}.entry-info{min-width:180px;flex:1}.entry-time{font-size:12px;color:#86868b}.entry-title{font-size:13px;line-height:1.4;margin-top:4px;white-space:pre-wrap;max-height:54px;overflow:hidden}.entry-badge{font-size:11px;color:#86868b;white-space:nowrap}.status{font-weight:600}.status-new{color:#0071e3}.status-updated{color:#ff9500}.status-failed{color:#c62828}.status-read{color:#86868b}.status-done{color:#86868b}.media-strip{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.media{width:78px;height:78px;border-radius:8px;overflow:hidden;position:relative;background:#eee;border:2px solid transparent;padding:0}.media:hover{border-color:#0071e3}.media img{width:100%;height:100%;object-fit:cover;display:block}.media.video{display:flex;align-items:center;justify-content:center;background:#222;color:#fff;font-size:12px}.media .mark{position:absolute;right:3px;bottom:3px;background:#000b;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.media.anchor{border-color:#ff9500;box-shadow:0 0 0 2px #ff950044}.media.range{border-color:#0071e3}.entry-marker{font-size:11px;color:#0071e3;margin-top:7px}.entry-marker b{color:#ff9500}.compact .media:not(:first-child){display:none}.compact .media-strip{min-height:78px}
 .side{position:sticky;top:calc(var(--top-height) + var(--tabs-height));align-self:start}.panel{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #e5e5ea}.panel h2{font-size:14px;margin:0 0 9px}.selection{font-size:12px;line-height:1.6;color:#555;min-height:48px}.selection strong{color:#1d1d1f}.count{font-size:12px;color:#0071e3;margin:8px 0}.draft{border-top:1px solid #e5e5ea;padding:9px 0;font-size:12px}.draft:first-of-type{border-top:0}.draft-title{font-weight:600}.draft-meta{color:#86868b;margin-top:3px}.job-actions{margin-top:6px}.job-actions button{font-size:11px;padding:4px 8px}.empty{padding:40px 12px;text-align:center;color:#86868b;background:#fff;border-radius:12px}
 #media-hover-preview{display:none;position:fixed;z-index:100;pointer-events:none;width:min(560px,calc(100vw - 16px));height:min(640px,70vh);padding:8px;box-sizing:border-box;border-radius:10px;background:#111;box-shadow:0 12px 36px rgba(0,0,0,.35);align-items:center;justify-content:center}#media-hover-preview img,#media-hover-preview video{display:block;max-width:100%;max-height:100%;object-fit:contain}.media.video{color:#fff}.media.video img{position:absolute;inset:0}.video-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#000a;border-radius:16px;padding:5px 9px;font-size:11px;white-space:nowrap}
 @media(max-width:900px){.layout{grid-template-columns:1fr}.side{position:static}.day-title{top:calc(var(--top-height) + var(--tabs-height))}}
 </style></head><body>
-<header class="top" id="top"><div class="topline"><h1>📦 日常选品工作台</h1><span class="muted" id="capture"></span><span class="muted" id="summary"></span><label class="switch"><input id="history" type="checkbox"> 查看全部历史</label><label class="date-filter">日期<select id="dateFilter"><option value="">全部日期</option></select></label><button id="compact">显示全部图片</button><button id="supplierToggle" class="supplier-toggle" type="button" aria-expanded="true">收起供货商</button></div><div class="supplier-list" id="supplierList"></div></header>
+<header class="top" id="top"><div class="topline"><h1>📦 日常选品工作台</h1><span class="muted" id="capture"></span><span class="muted" id="summary"></span><label class="switch"><input id="history" type="checkbox"> 查看全部历史</label><label class="date-filter">日期<select id="dateFilter"><option value="">全部日期</option></select></label><button id="compact">显示全部图片</button><button class="mark-read" type="button">本批已阅</button><button id="supplierToggle" class="supplier-toggle" type="button" aria-expanded="true">收起供货商</button></div><div class="supplier-list" id="supplierList"></div></header>
 <main class="layout"><section class="timeline"><div class="tabs" id="tabs"></div><div id="entries"></div></section><aside class="side"><div class="panel"><h2>当前选择</h2><div class="selection" id="selection">先点击一个条目作为起点</div><div class="count" id="rangeCount"></div><button class="primary" id="create" disabled>创建商品</button><button id="clear" style="margin-left:6px">清除选择</button></div><div class="panel"><h2>商品队列 <span id="draftCount">0</span></h2><div id="drafts"><div class="muted">还没有创建商品</div></div><button class="danger" id="undo" disabled>撤销上一个草稿</button><button class="primary" id="process" disabled style="margin-top:8px;width:100%">确认并开始处理</button></div></aside></main>
 <div id="media-hover-preview" aria-hidden="true"></div>
 <script>
@@ -1376,22 +1404,22 @@ const allCurrentItems=()=>{const s=current();if(!s)return [];return state.histor
 const items=()=>{const list=allCurrentItems();return state.date?list.filter(i=>i.workbenchDate===state.date):list};
 function syncLayoutOffsets(){document.documentElement.style.setProperty('--top-height',`${$('top').offsetHeight}px`);document.documentElement.style.setProperty('--tabs-height',`${$('tabs').offsetHeight}px`)}
 function init(){
-  const first=DATA.find(s=>s.newCount>0)||DATA[0];state.active=first?.albumId||null;
+  const first=DATA.find(s=>s.pendingCount>0)||DATA[0];state.active=first?.albumId||null;
   const captureTs=CAPTURE_TIME?Date.parse(CAPTURE_TIME.replace(' ','T')):NaN;const stale=captureTs&&!Number.isNaN(captureTs)&&Date.now()-captureTs>24*60*60*1000;$('capture').textContent=CAPTURE_TIME?(stale?`抓取状态：可能过期 · ${CAPTURE_TIME}`:`抓取状态：已成功 · ${CAPTURE_TIME}`):'抓取状态：未知';renderSuppliers();renderDateFilter();renderTabs();render();syncLayoutOffsets();
 }
 function renderDateFilter(){const dates=[...new Set(allCurrentItems().map(i=>i.workbenchDate).filter(Boolean))];$('dateFilter').innerHTML='<option value="">全部日期</option>'+dates.map(date=>`<option value="${esc(date)}">${esc(date)}</option>`).join('');$('dateFilter').value=state.date;}
-function statusLabel(status){return {new:'新增',updated:'已更新',failed:'处理失败',done:'已处理'}[status]||'待处理'}
-function statusSummary(s){const c=s.statusCounts||{};return [['new','新增'],['updated','更新'],['failed','失败']].filter(([key])=>c[key]).map(([key,label])=>`${label} ${c[key]}`).join(' · ')||'无待处理'}
+function statusLabel(status){return {new:'新增',updated:'已更新',failed:'处理失败',read:'已阅',done:'已处理'}[status]||'待处理'}
+function statusSummary(s){const c=s.statusCounts||{},parts=[['new','新增'],['updated','已更新'],['failed','处理失败']].filter(([key])=>c[key]).map(([key,label])=>`${label} ${c[key]}`),pending=(c.new||0)+(c.updated||0)+(c.failed||0);return pending?`待处理 ${pending}${parts.length?'（'+parts.join(' · ')+'）':''}`:'无待处理'}
 function captureSummary(s){if(s.captureOk===false)return `抓取失败${s.captureError?' · '+esc(s.captureError):''}`;if(s.captureOk===true)return `${statusSummary(s)} · 本次抓取成功`;return statusSummary(s)}
 function renderSuppliers(){
-  $('supplierList').innerHTML=DATA.map(s=>`<label class="${s.newCount||s.captureOk===false?'active':''}"><input type="checkbox" data-aid="${esc(s.albumId)}" ${s.newCount||s.captureOk===false?'checked':''}><span>${esc(s.supplier)}</span><small>${captureSummary(s)}</small></label>`).join('');
+  $('supplierList').innerHTML=DATA.map(s=>`<label class="${s.pendingCount||s.captureOk===false?'active':''}"><input type="checkbox" data-aid="${esc(s.albumId)}" ${s.pendingCount||s.captureOk===false?'checked':''}><span>${esc(s.supplier)}</span><small>${captureSummary(s)}</small></label>`).join('');
   $('supplierList').querySelectorAll('input').forEach(input=>input.onchange=()=>{const selected=[...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid);if(!selected.includes(state.active))state.active=selected[0]||null;state.date='';renderDateFilter();renderTabs();render();});
 }
 function setSupplierOpen(open){if(state.supplierOpen===open)return;state.supplierOpen=open;$('top').classList.toggle('collapsed',!open);$('supplierToggle').textContent=open?'收起供货商':'展开供货商';$('supplierToggle').setAttribute('aria-expanded',String(open));syncLayoutOffsets();}
 let lastScrollY=window.scrollY,scrollTick=false;
 window.addEventListener('scroll',()=>{if(scrollTick)return;scrollTick=true;requestAnimationFrame(()=>{const y=window.scrollY;if(y>lastScrollY&&state.supplierOpen)setSupplierOpen(false);lastScrollY=y;scrollTick=false})},{passive:true});
 function selectedSuppliers(){const ids=new Set([...document.querySelectorAll('#supplierList input:checked')].map(i=>i.dataset.aid));return DATA.filter(s=>ids.has(s.albumId))}
-function renderTabs(){const chosen=selectedSuppliers();if(!chosen.some(s=>s.albumId===state.active))state.active=chosen[0]?.albumId||null;$('tabs').innerHTML=chosen.map(s=>`<button class="tab ${s.albumId===state.active?'active':''}" data-aid="${esc(s.albumId)}">${esc(s.supplier)} · ${state.history?s.items.length:s.newCount}</button>`).join('');$('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{state.active=b.dataset.aid;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()});syncLayoutOffsets();}
+function renderTabs(){const chosen=selectedSuppliers();if(!chosen.some(s=>s.albumId===state.active))state.active=chosen[0]?.albumId||null;$('tabs').innerHTML=chosen.map(s=>`<button class="tab ${s.albumId===state.active?'active':''}" data-aid="${esc(s.albumId)}">${esc(s.supplier)} · ${state.history?s.items.length:s.pendingCount}</button>`).join('');$('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{state.active=b.dataset.aid;state.date='';state.selection={start:null,end:null};renderDateFilter();renderTabs();render()});syncLayoutOffsets();}
 function mediaFor(item){return item.workbenchMedia||[]}
 function sameAnchor(a,b){return a&&b&&a.goodsId===b.goodsId}
 function currentRange(){const list=items(),s=state.selection;if(!s.start||!s.end)return null;const a=list.findIndex(i=>i.goods_id===s.start.goodsId),b=list.findIndex(i=>i.goods_id===s.end.goodsId);if(a<0||b<0)return null;const lo=Math.min(a,b),hi=Math.max(a,b);return {lo,hi,items:list.slice(lo,hi+1)};}
@@ -1426,6 +1454,9 @@ function downloadJson(name,value){const a=document.createElement('a');a.href=URL
 function cancelSubmitted(jobId){const job=state.submitted.find(item=>item.jobId===jobId);if(!job)return;downloadJson(`cancelled_job_${job.jobId}.json`,{jobId:job.jobId});state.submitted=state.submitted.filter(item=>item.jobId!==jobId);job.items.forEach(item=>state.locked.delete(item.goods_id));state.selection={start:null,end:null};render();alert('已撤销该商品，可以重新选择');}
 function renderSide(range){const s=current(),sel=state.selection;const fmt=a=>{if(!a)return'未选择';const i=(s?.items||[]).find(x=>x.goods_id===a.goodsId);return `${i?.workbenchTime||a.goodsId} · 条目`};const overlap=range&&range.items.some(i=>state.locked.has(i.goods_id));$('selection').innerHTML=`起点：<strong>${esc(fmt(sel.start))}</strong><br>终点：<strong>${esc(fmt(sel.end))}</strong>`;$('rangeCount').textContent=range?`${range.items.length} 个条目，${range.items.reduce((n,i)=>n+mediaFor(i).length,0)} 个素材${overlap?' · 包含已创建内容':''}`:'';$('create').disabled=!range||overlap;$('draftCount').textContent=state.drafts.length+state.submitted.length;$('undo').disabled=!state.drafts.length;$('process').disabled=!state.drafts.length;const drafts=state.drafts.map((d,i)=>`<div class="draft"><div class="draft-title">${i+1}. ${esc(d.supplier)} · 商品 ${d.index}</div><div class="draft-meta">待提交 · ${d.items.length} 个条目 · ${d.items.reduce((n,x)=>n+mediaFor(x).length,0)} 个素材 · ${esc(d.label)}</div></div>`).join('');const submitted=state.submitted.map(job=>`<div class="draft"><div class="draft-title">${esc(job.supplier)} · ${esc(job.label||'商品')}</div><div class="draft-meta">处理中/等待分类预览 · ${job.items.length} 个条目</div><div class="job-actions"><button class="danger cancel-job" data-job="${esc(job.jobId)}">撤销并重新选择</button></div></div>`).join('');$('drafts').innerHTML=drafts+submitted||( '<div class="muted">还没有创建商品</div>');$('drafts').querySelectorAll('.cancel-job').forEach(button=>button.onclick=()=>cancelSubmitted(button.dataset.job));}
 $('process').onclick=()=>{const batch=state.drafts.slice();if(!batch.length)return;const stamp=Date.now();const cleanItem=i=>{const {workbenchMedia,_new,workbenchDate,workbenchTime,workbenchStatus,...raw}=i;return raw};const jobs=batch.map((d,index)=>({jobId:`${stamp}_${index+1}`,supplier:d.supplier,albumId:d.albumId,label:`${d.supplier} · 商品 ${d.index}`,items:d.items.map(cleanItem)}));downloadJson(`confirmed_groups_${stamp}.json`,{jobs});state.submitted.push(...jobs);state.drafts=[];state.selection={start:null,end:null};render();alert(`已提交 ${jobs.length} 个商品，分类预览可同时生成；如需重选，可在商品队列中撤销`);};
+function refreshSupplierStatus(s){const counts={new:0,updated:0,failed:0,read:0,done:0};s.items.forEach(item=>{counts[item.workbenchStatus||'new']=(counts[item.workbenchStatus||'new']||0)+1});s.statusCounts=counts;s.pendingCount=(counts.new||0)+(counts.updated||0)+(counts.failed||0)}
+function markCurrentRead(){const s=current(),pending=new Set(['new','updated','failed']),list=items().filter(item=>pending.has(item.workbenchStatus));if(!s||!list.length){alert('当前没有待阅条目');return}downloadJson(`read_items_${Date.now()}.json`,{reads:[{supplier:s.supplier,albumId:s.albumId,items:list.map(item=>({goods_id:item.goods_id,title:item.title||'',imgsSrc:item.imgsSrc||[],time_stamp:item.time_stamp,update_time:item.update_time,videoUrl:item.videoUrl||item.videoURL||''}))}]});list.forEach(item=>{item.workbenchStatus='read';item._new=false});refreshSupplierStatus(s);renderSuppliers();renderDateFilter();renderTabs();render();alert(`已阅 ${list.length} 个条目；内容以后发生变化时仍会重新进入待处理`)}
+document.querySelectorAll('.mark-read').forEach(button=>button.onclick=markCurrentRead);
 render();
 </script></body></html>'''
     html = html.replace("__PAYLOAD__", payload).replace("__CAPTURE_TIME__", capture_payload)
@@ -1923,6 +1954,32 @@ def _confirmed_download_paths(watch_dir):
     return [p for p in watch_dir.iterdir() if pattern.fullmatch(p.name)] if watch_dir.exists() else []
 
 
+def _read_download_paths(watch_dir):
+    """找出工作台的已阅记录文件."""
+    pattern = re.compile(r"^read_items(?:_\d+)?(?: \(\d+\))?\.json$")
+    return [p for p in watch_dir.iterdir() if pattern.fullmatch(p.name)] if watch_dir.exists() else []
+
+
+def _apply_read_file(progress, path):
+    """应用一份工作台已阅记录并归档, 让下次抓取不再重复显示同一版本."""
+    source = Path(path)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    _record_read_items(progress, payload.get("reads") or [])
+    archived = _archive_download(source)
+    try:
+        archived.rename(archived.with_suffix(".done.json"))
+    except OSError:
+        pass
+
+
+def _consume_pending_read_files(progress):
+    for path in sorted(_read_download_paths(Path.home() / "Downloads"), key=lambda p: p.stat().st_mtime):
+        try:
+            _apply_read_file(progress, path)
+        except Exception as e:
+            print(f"⚠ 已阅记录处理失败 {path.name}: {e}")
+
+
 def ensure_data_for_date(
         scrape_path, config, supplier_name, date_str, timeout=240, code="",
         force_fetch=True, range_start="", range_end="", raise_interrupt=False):
@@ -2381,6 +2438,36 @@ def wait_for_confirmed(watch_dir=None, timeout=None):
     print("\n⚠ 超时未收到确认文件"); return None
 
 
+def wait_for_workbench_file(watch_dir=None, timeout=None):
+    """同时等待商品提交或已阅记录, 避免已阅要等到下次启动才生效."""
+    watch_dir = watch_dir or (Path.home() / "Downloads")
+    start_ts = time.time() - 1
+    wait_hint = f"最长 {timeout} 秒" if timeout is not None else "一直等待"
+    print(f"\n⏳ 等浏览器里提交商品或点击「本批已阅」... ({wait_hint}, Ctrl+C 退出)")
+    print(f"   监听: {watch_dir}/confirmed_groups*.json, read_items*.json")
+    end = time.time() + timeout if timeout is not None else None
+    try:
+        while end is None or time.time() < end:
+            candidates = [
+                (path, "confirmed") for path in _confirmed_download_paths(watch_dir)
+                if path.stat().st_mtime > start_ts
+            ] + [
+                (path, "read") for path in _read_download_paths(watch_dir)
+                if path.stat().st_mtime > start_ts
+            ]
+            if candidates:
+                target, kind = max(candidates, key=lambda pair: pair[0].stat().st_mtime)
+                size = target.stat().st_size
+                time.sleep(0.5)
+                if target.stat().st_size == size and size > 0:
+                    return kind, target
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n已取消等待"); return None
+    print("\n⚠ 超时未收到工作台文件")
+    return None
+
+
 def _process_confirmed_file(config, progress, confirmed):
     try:
         cmd_process_confirmed(config, progress, str(confirmed))
@@ -2682,6 +2769,7 @@ def main():
         print(f"配置文件不存在: {CONFIG_FILE}"); sys.exit(1)
     _apply_defaults(config)
     progress = load_json_or(PROGRESS_FILE, {})
+    _consume_pending_read_files(progress)
 
     # bookmark: 生成书签安装页
     if mode == "bookmark":
@@ -2996,11 +3084,16 @@ def main():
     executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="batch")
     try:
         while True:
-            confirmed = wait_for_confirmed()
-            if not confirmed:
+            workbench_file = wait_for_workbench_file()
+            if not workbench_file:
                 print("未收到确认文件, 退出。稍后可手动: python3 pick_products.py process <confirmed_groups.json>")
                 return
-            confirmed = _archive_download(confirmed)
+            kind, path = workbench_file
+            if kind == "read":
+                _apply_read_file(progress, path)
+                print(f"✓ 已阅记录已保存: {path.name}")
+                continue
+            confirmed = _archive_download(path)
             print(f"\n✓ 收到确认文件: {confirmed}, 已加入并行处理队列...")
             executor.submit(_process_confirmed_file, config, progress, confirmed)
     finally:

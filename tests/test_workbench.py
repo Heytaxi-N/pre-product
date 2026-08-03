@@ -29,7 +29,7 @@ class WorkbenchTests(unittest.TestCase):
             {"album": {"supplier": "测试供货商", "items": items}}, {}
         )
 
-        self.assertEqual(2, payload[0]["newCount"])
+        self.assertEqual(2, payload[0]["pendingCount"])
         self.assertTrue(all(item["_new"] for item in payload[0]["items"]))
         self.assertEqual(["two", "one"], [
             item["goods_id"] for item in payload[0]["items"]
@@ -51,7 +51,7 @@ class WorkbenchTests(unittest.TestCase):
                 [{
                     "supplier": "测试供货商",
                     "albumId": "album",
-                    "newCount": 1,
+                    "pendingCount": 1,
                     "items": [{
                         "goods_id": "one",
                         "title": "商品一",
@@ -89,6 +89,9 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("{jobs}", html)
         self.assertIn("cancelled_job_", html)
         self.assertIn("state.submitted", html)
+        self.assertIn("本批已阅", html)
+        self.assertIn("read_items_", html)
+        self.assertIn("待处理", html)
 
     def test_confirmed_jobs_expand_each_product(self):
         jobs = pick_products._confirmed_jobs({
