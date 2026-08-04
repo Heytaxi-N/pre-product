@@ -16,6 +16,7 @@ CONFIG_FILE = SCRIPT_DIR / (sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].end
 PROGRESS_FILE = SCRIPT_DIR / "progress.json"
 FEISHU_PENDING_FILE = SCRIPT_DIR / "feishu_pending.json"
 WEIDIAN_CATEGORIES_FILE = SCRIPT_DIR / "data" / "weidian_categories.json"
+WEIDIAN_MODELS_FILE = SCRIPT_DIR / "data" / "weidian_models.json"
 OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
 TMP_ROOT = Path(tempfile.gettempdir()) / "weidian_pick"  # 临时/缓存, 不落在商品图里
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 config.json 里配 defaults.max_products
@@ -449,6 +450,159 @@ def match_weidian_categories(text, ai_config, categories=None):
         return fallback
 
 
+def load_weidian_models(path=WEIDIAN_MODELS_FILE):
+    """读取微店型号缓存, 返回 [{name, values}] 白名单."""
+    raw = load_json_or(Path(path), [])
+    source = raw.get("attr_list", []) if isinstance(raw, dict) else raw
+    rows = []
+    seen = set()
+    for item in source if isinstance(source, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("attr_title", item.get("name", ""))).strip()
+        values = item.get("attr_values", item.get("values", []))
+        if not name or not isinstance(values, list):
+            continue
+        key = _category_key(name)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"name": name, "values": [str(v).strip() for v in values if str(v).strip()]})
+    return rows
+
+
+def _model_value_key(value):
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+_BASE_COLOR_ALIASES = {
+    "红色": ("红", "玫瑰", "桃红", "酒红", "大红", "橙红", "红褐", "梅紫红"),
+    "橙色": ("橙", "橘"),
+    "黄色": ("黄", "姜黄", "芥末", "柠檬"),
+    "绿色": ("绿", "苔藓", "抹茶", "豆沙绿"),
+    "蓝色": ("蓝", "藏青", "宝蓝", "湖蓝"),
+    "紫色": ("紫", "梅紫", "薰衣草"),
+    "粉色": ("粉", "肉粉"),
+    "黑色": ("黑", "墨黑"),
+    "白色": ("白", "骨白", "本白", "象牙白"),
+    "灰色": ("灰", "银灰"),
+    "棕色": ("棕", "咖", "褐"),
+    "米色": ("米", "杏", "香草"),
+    "卡其": ("卡其", "土驼"),
+}
+
+
+def _resolve_model_value(category, value, allowed):
+    by_key = {_model_value_key(item): item for item in allowed}
+    exact = by_key.get(_model_value_key(value))
+    if exact:
+        return [exact]
+    if "颜色" not in category:
+        return []
+    text = str(value or "")
+    result = []
+    for base, aliases in _BASE_COLOR_ALIASES.items():
+        if any(alias in text for alias in aliases):
+            match = by_key.get(_model_value_key(base))
+            if match and match not in result:
+                result.append(match)
+    return result
+
+
+def _fallback_models(text, models):
+    source = str(text or "")
+    result = []
+    for group in models:
+        group_named = group["name"] in source
+        values = []
+        for value in group["values"]:
+            if value.isdigit() and not group_named:
+                continue
+            if re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])", source, re.I
+            ):
+                values.append(value)
+        for base, aliases in _BASE_COLOR_ALIASES.items():
+            if "颜色" in group["name"] and any(alias in source for alias in aliases):
+                values.extend(_resolve_model_value(group["name"], base, group["values"]))
+        unique = []
+        allowed = {_model_value_key(value): value for value in group["values"]}
+        for value in values:
+            value = allowed.get(_model_value_key(value), value)
+            if value in group["values"] and value not in unique:
+                unique.append(value)
+        if unique:
+            def source_position(value):
+                patterns = [value]
+                if "颜色" in group["name"]:
+                    aliases = next((names for base, names in _BASE_COLOR_ALIASES.items()
+                                    if _model_value_key(base) == _model_value_key(value)), ())
+                    patterns.extend(aliases)
+                positions = [match.start() for pattern in patterns
+                             if (match := re.search(re.escape(pattern), source, re.I))]
+                return min(positions) if positions else len(source)
+            unique.sort(key=source_position)
+            result.append({"name": group["name"], "values": unique})
+    return result
+
+
+def match_weidian_models(text, ai_config, models=None):
+    """按文案识别已有型号; 所有输出必须来自微店型号白名单."""
+    models = models or load_weidian_models()
+    fallback = _fallback_models(text, models)
+    base_url = (ai_config or {}).get("base_url", "").rstrip("/")
+    api_key = (ai_config or {}).get("api_key", "")
+    if not (base_url and api_key and models):
+        return fallback
+    prompt = (
+        "根据商品文案识别已有型号。只返回文案明确提到的型号,不能猜测或编造。\n"
+        "颜色可以把复杂颜色归并到候选中的基础色,例如玫瑰红归并为红色;其他规格必须严格匹配候选值。\n"
+        "只返回 JSON: {\"models\":[{\"name\":\"颜色\",\"values\":[\"红色\"]}]}。\n"
+        f"候选型号: {json.dumps(models, ensure_ascii=False)}\n商品文案:\n{text}\n"
+    )
+    payload = {"model": (ai_config or {}).get("model", "qwen3-vl-flash"),
+               "max_tokens": 240,
+               "messages": [{"role": "user", "content": prompt}]}
+    try:
+        resp = http_post_json(f"{base_url}/chat/completions", payload,
+                              headers={"Authorization": f"Bearer {api_key}"})
+        answer = resp["choices"][0]["message"]["content"].strip()
+        start, end = answer.find("{"), answer.rfind("}")
+        data = json.loads(answer[start:end + 1]) if start >= 0 else {}
+        groups = {_category_key(group["name"]): group for group in models}
+        matched = []
+        for item in data.get("models", []):
+            if not isinstance(item, dict):
+                continue
+            group = groups.get(_category_key(item.get("name")))
+            if not group:
+                continue
+            values = []
+            for value in item.get("values", []):
+                for resolved in _resolve_model_value(group["name"], value, group["values"]):
+                    if resolved not in values:
+                        values.append(resolved)
+            if values:
+                matched.append({"name": group["name"], "values": values})
+        by_name = {_category_key(group["name"]): group for group in matched}
+        for group in fallback:
+            target = by_name.setdefault(_category_key(group["name"]), group)
+            for value in group["values"]:
+                if value not in target["values"]:
+                    target["values"].append(value)
+        return [by_name[_category_key(group["name"])] for group in models
+                if _category_key(group["name"]) in by_name]
+    except Exception as e:
+        print(f"  ⚠ 微店型号识别失败, 使用白名单文字命中: {str(e)[:100]}")
+        return fallback
+
+
+def format_model_field(matches):
+    return "\n".join(
+        f"{group['name']}：{'、'.join(group['values'])}" for group in matches if group["values"]
+    )
+
+
 def parse_cost_price(text):
     """提取💰后的成本价, 找不到返回 None."""
     match = re.search(r"💰\s*[:：]?\s*(\d+(?:\.\d+)?)", str(text or ""))
@@ -484,6 +638,9 @@ def build_auto_fields(text, ai_config, fs_config, category_options=None):
     if cost is not None:
         fields[fs_config.get("cost_field", "成本价")] = cost
         fields[fs_config.get("sale_field", "售价")] = calculate_sale_price(cost)
+    models = match_weidian_models(text, ai_config)
+    if models:
+        fields[fs_config.get("model_field", "型号")] = format_model_field(models)
     return fields, categories, cost
 
 
@@ -1369,6 +1526,9 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                             print(f"  ✓ 分类: {'、'.join(matched_categories)}")
                         if cost is not None:
                             print(f"  ✓ 成本价: {cost} · 售价: {record_fields[fs_cfg.get('sale_field', '售价')]}")
+                        model_value = record_fields.get(fs_cfg.get("model_field", "型号"))
+                        if model_value:
+                            print(f"  ✓ 型号: {model_value.replace(chr(10), ' | ')}")
                     except Exception:
                         feishu_pending.pop(pending_key, None)
                         save_json(FEISHU_PENDING_FILE, feishu_pending)

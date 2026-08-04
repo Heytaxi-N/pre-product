@@ -19,9 +19,28 @@ class AutoFieldTests(unittest.TestCase):
             result,
         )
 
-    def test_build_auto_fields_omits_model(self):
+    def test_model_matches_whitelist_and_base_color(self):
+        models = pick_products.load_weidian_models()
+        matched = pick_products.match_weidian_models(
+            "颜色：玫瑰红、黑色，尺码2：m、l、xl", {}, models
+        )
+        self.assertEqual(
+            [{"name": "颜色", "values": ["红色", "黑色"]},
+             {"name": "尺码2", "values": ["M", "L", "XL"]}],
+            matched,
+        )
+        self.assertEqual(
+            "颜色：红色、黑色\n尺码2：M、L、XL",
+            pick_products.format_model_field(matched),
+        )
+
+    def test_model_does_not_invent_values(self):
+        self.assertEqual([], pick_products.match_weidian_models("荧光青、7XL", {},
+                                                               pick_products.load_weidian_models()))
+
+    def test_build_auto_fields_writes_model(self):
         fields, categories, cost = pick_products.build_auto_fields(
-            "凯乐石 女款短袖 💰40", {}, {}
+            "凯乐石 女款短袖 颜色：玫瑰红、黑色 尺码2：m、l、xl 💰40", {}, {}
         )
         self.assertEqual(
             ["【上装】短袖/打底/外套等", "【女装】美女看这里", "凯乐石"],
@@ -33,7 +52,10 @@ class AutoFieldTests(unittest.TestCase):
         )
         self.assertEqual(40, cost)
         self.assertEqual(58, fields["售价"])
-        self.assertNotIn("型号", fields)
+        self.assertEqual(
+            "颜色：红色、黑色\n类别：女款、短袖\n尺码2：M、L、XL",
+            fields["型号"],
+        )
 
     def test_build_auto_fields_filters_missing_feishu_options(self):
         fields, _, _ = pick_products.build_auto_fields(
