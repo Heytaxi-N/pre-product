@@ -5,7 +5,7 @@
   # 然后运行:
   SCRAPE_JSON=~/Downloads/scrape.json python3 pick_products.py
 """
-import json, os, sys, time, shutil, base64, hashlib, tempfile, re, threading
+import json, math, os, sys, time, shutil, base64, hashlib, tempfile, re, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +15,7 @@ SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / (sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].endswith(".json") else "config.json")
 PROGRESS_FILE = SCRIPT_DIR / "progress.json"
 FEISHU_PENDING_FILE = SCRIPT_DIR / "feishu_pending.json"
+WEIDIAN_CATEGORIES_FILE = SCRIPT_DIR / "data" / "weidian_categories.json"
 OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
 TMP_ROOT = Path(tempfile.gettempdir()) / "weidian_pick"  # 临时/缓存, 不落在商品图里
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 config.json 里配 defaults.max_products
@@ -361,6 +362,131 @@ def classify_images_ai(ai_config, image_paths, palette=None):
     return results
 
 
+# ── 商品字段自动填充 ─────────────────────────────────
+def load_weidian_categories(path=WEIDIAN_CATEGORIES_FILE):
+    """读取微店分类缓存, 返回扁平化的 {name, cate_id, parent_id} 列表."""
+    raw = load_json_or(Path(path), [])
+    rows = []
+    for parent in raw if isinstance(raw, list) else raw.get("cateInfos", []):
+        if not isinstance(parent, dict):
+            continue
+        rows.append({
+            "name": str(parent.get("cateName", "")).strip(),
+            "cate_id": parent.get("cateId"),
+            "parent_id": parent.get("parentId", 0),
+        })
+        for child in parent.get("children", []):
+            if isinstance(child, dict):
+                rows.append({
+                    "name": str(child.get("cateName", "")).strip(),
+                    "cate_id": child.get("cateId"),
+                    "parent_id": child.get("parentId", parent.get("cateId")),
+                })
+    return [row for row in rows if row["name"]]
+
+
+def _category_key(text):
+    return re.sub(r"[\s【】\[\]（）()、，,/\\_\-]+", "", str(text or "")).lower()
+
+
+def _fallback_categories(text, categories):
+    source = _category_key(text)
+    matched = []
+    aliases = {
+        "【特价区】买到赚到": ("特价", "折扣"),
+        "【上装】短袖/打底/外套等": ("上衣", "短袖", "打底", "外套", "冲锋衣", "夹克", "羽绒", "卫衣", "T恤"),
+        "【下装】各类长短内裤": ("裤", "裙", "内裤"),
+        "【鞋子】溯溪/跑山鞋/凉拖等": ("鞋", "凉拖", "拖鞋", "溯溪"),
+        "【配件】背包/帽子/袜子等": ("包", "背包", "帽", "袜", "腰带"),
+        "【男装】猛男点这里": ("男装", "男款", "男士"),
+        "【女装】美女看这里": ("女装", "女款", "女士"),
+    }
+    for row in categories:
+        name = row["name"]
+        if name in ("未分类", "店长推荐", "品牌分类"):
+            continue
+        key = _category_key(name)
+        if key and (key in source or any(_category_key(term) in source for term in aliases.get(name, ()) )):
+            matched.append(name)
+    return matched
+
+
+def match_weidian_categories(text, ai_config, categories=None):
+    """按文案语义从微店分类中多选; AI 失败时只保留明确的文字命中."""
+    categories = categories or load_weidian_categories()
+    names = [row["name"] for row in categories
+             if row["name"] not in ("未分类", "店长推荐", "品牌分类")]
+    fallback = _fallback_categories(text, categories)
+    base_url = (ai_config or {}).get("base_url", "").rstrip("/")
+    api_key = (ai_config or {}).get("api_key", "")
+    if not (base_url and api_key and names):
+        return fallback
+    prompt = (
+        "根据商品文案,从给定的微店店铺分类中选择最符合的一个或多个分类。\n"
+        "只返回 JSON: {\"categories\":[\"分类名称\"]};不能返回列表之外的名称。\n"
+        "品牌商品通常选择品牌子分类,同时可选择最符合的品类分类;不要选择‘未分类’或‘店长推荐’,除非文案确实无法判断。\n"
+        f"候选分类: {json.dumps(names, ensure_ascii=False)}\n"
+        f"商品文案:\n{text}\n"
+    )
+    payload = {"model": (ai_config or {}).get("model", "qwen3-vl-flash"),
+               "max_tokens": 120,
+               "messages": [{"role": "user", "content": prompt}]}
+    try:
+        resp = http_post_json(f"{base_url}/chat/completions", payload,
+                              headers={"Authorization": f"Bearer {api_key}"})
+        answer = resp["choices"][0]["message"]["content"].strip()
+        start, end = answer.find("{"), answer.rfind("}")
+        data = json.loads(answer[start:end + 1]) if start >= 0 else {}
+        allowed = {_category_key(name): name for name in names}
+        result = []
+        for item in data.get("categories", []):
+            name = allowed.get(_category_key(item))
+            if name and name not in result and name not in ("未分类", "店长推荐"):
+                result.append(name)
+        return result or fallback
+    except Exception as e:
+        print(f"  ⚠ 微店分类语义识别失败, 使用明确文字命中: {str(e)[:100]}")
+        return fallback
+
+
+def parse_cost_price(text):
+    """提取💰后的成本价, 找不到返回 None."""
+    match = re.search(r"💰\s*[:：]?\s*(\d+(?:\.\d+)?)", str(text or ""))
+    if not match:
+        return None
+    value = float(match.group(1))
+    return int(value) if value.is_integer() else value
+
+
+def calculate_sale_price(cost):
+    """售价至少加15元且达到成本价的120%, 向上取到个位8."""
+    target = max(float(cost) * 1.2, float(cost) + 15)
+    rounded = math.ceil(target)
+    return rounded + (8 - rounded % 10) % 10
+
+
+def build_auto_fields(text, ai_config, fs_config, category_options=None):
+    fields = {}
+    all_categories = load_weidian_categories()
+    categories = match_weidian_categories(text, ai_config, all_categories)
+    if categories:
+        category_rows = {row["name"]: row for row in all_categories}
+        prefix = fs_config.get("category_child_prefix", "品牌分类-")
+        formatted = [
+            f"{prefix}{name}" if category_rows[name]["parent_id"] else name
+            for name in categories
+        ]
+        if category_options is not None:
+            formatted = [name for name in formatted if name in category_options]
+        if formatted:
+            fields[fs_config.get("category_field", "分类")] = formatted
+    cost = parse_cost_price(text)
+    if cost is not None:
+        fields[fs_config.get("cost_field", "成本价")] = cost
+        fields[fs_config.get("sale_field", "售价")] = calculate_sale_price(cost)
+    return fields, categories, cost
+
+
 def sort_by_new_rule(classified):
     """新顺序(每类空则跳过):
       合图(实拍最美1张) → 价格图(1张) → 产品包装图(≤3) → 模特图(评分前15)
@@ -406,6 +532,7 @@ class Feishu:
         self.cfg = cfg
         self.token = None
         self.token_expire = 0
+        self.field_options = {}
 
     def _tenant_token(self):
         if self.token and time.time() < self.token_expire - 60:
@@ -436,6 +563,32 @@ class Feishu:
         if data.get("code") != 0:
             raise RuntimeError(f"飞书读取失败: {data}")
         return data["data"]["record"]["fields"]
+
+    def get_field_options(self, field_name):
+        if field_name in self.field_options:
+            return self.field_options[field_name]
+        url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
+            f"{self.cfg['base_id']}/tables/{self.cfg['table_id']}/fields?page_size=100"
+        )
+        data = http_get_json(url, headers=self._auth_header())
+        if data.get("code") != 0:
+            raise RuntimeError(f"读取飞书字段失败: {data}")
+        field = next(
+            (item for item in data.get("data", {}).get("items", [])
+             if item.get("field_name") == field_name),
+            None,
+        )
+        if not field:
+            raise RuntimeError(f"飞书字段不存在: {field_name}")
+        if field.get("type") != 4:
+            raise RuntimeError(f"飞书字段不是多选类型: {field_name}")
+        options = [
+            str(item.get("name", "")).strip()
+            for item in (field.get("property") or {}).get("options", [])
+        ]
+        self.field_options[field_name] = {name for name in options if name}
+        return self.field_options[field_name]
 
     def wait_for_field(self, record_id, field_name, timeout=90):
         """轮询等待自动生成字段(如"图片名")出现"""
@@ -1198,9 +1351,24 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                     feishu_pending[pending_key] = {"status": "creating"}
                     save_json(FEISHU_PENDING_FILE, feishu_pending)
                     try:
-                        record_id = feishu.create_record({
-                            fs_cfg.get("info_field", "信息"): pr["combined_text"]
-                        })
+                        category_options = (
+                            feishu.get_field_options(
+                                fs_cfg.get("category_field", "分类")
+                            )
+                            if hasattr(feishu, "get_field_options") else None
+                        )
+                        auto_fields, matched_categories, cost = build_auto_fields(
+                            pr["combined_text"], ai_cfg, fs_cfg, category_options
+                        )
+                        record_fields = {
+                            fs_cfg.get("info_field", "信息"): pr["combined_text"],
+                            **auto_fields,
+                        }
+                        record_id = feishu.create_record(record_fields)
+                        if matched_categories:
+                            print(f"  ✓ 分类: {'、'.join(matched_categories)}")
+                        if cost is not None:
+                            print(f"  ✓ 成本价: {cost} · 售价: {record_fields[fs_cfg.get('sale_field', '售价')]}")
                     except Exception:
                         feishu_pending.pop(pending_key, None)
                         save_json(FEISHU_PENDING_FILE, feishu_pending)

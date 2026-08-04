@@ -20,6 +20,10 @@
     "base_id": "",
     "table_id": "",
     "info_field": "信息",
-    "img_name_field": "图片名"
+    "img_name_field": "图片名",
+    "category_field": "分类",
+    "category_child_prefix": "品牌分类-",
+    "cost_field": "成本价",
+    "sale_field": "售价"
   }
 }
