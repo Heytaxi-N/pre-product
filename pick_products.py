@@ -1050,6 +1050,22 @@ class Feishu:
         self.field_options.pop(field_name, None)
         return self.get_field_options(field_name)
 
+    def wait_for_field(self, record_id, field_name, timeout=90):
+        """轮询等待自动生成字段(如"图片名")出现"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            fields = self.get_record(record_id)
+            val = fields.get(field_name)
+            # 飞书字段返回可能是 [{"text": "..."}] 或 字符串
+            if isinstance(val, list) and val:
+                v = val[0].get("text") if isinstance(val[0], dict) else val[0]
+                if v:
+                    return str(v)
+            elif isinstance(val, str) and val:
+                return val
+            time.sleep(2)
+        raise RuntimeError(f"等待字段 {field_name} 超时")
+
 
 def sync_category_field_options(feishu, fs_config):
     field_name = fs_config.get("category_field", "分类")
@@ -1068,23 +1084,6 @@ def sync_category_field_options(feishu, fs_config):
         "removed": sorted(current - set(options)),
         "options": options,
     }
-
-    def wait_for_field(self, record_id, field_name, timeout=90):
-        """轮询等待自动生成字段(如"图片名")出现"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            fields = self.get_record(record_id)
-            val = fields.get(field_name)
-            # 飞书字段返回可能是 [{"text": "..."}] 或 字符串
-            if isinstance(val, list) and val:
-                v = val[0].get("text") if isinstance(val[0], dict) else val[0]
-                if v:
-                    return str(v)
-            elif isinstance(val, str) and val:
-                return val
-            time.sleep(2)
-        raise RuntimeError(f"等待字段 {field_name} 超时")
-
 
 _KEYWORD_STOPWORDS = {
     "商品", "新款", "现货", "上新", "专柜", "正品", "男女", "均码", "图片", "颜色",

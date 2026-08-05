@@ -2,6 +2,7 @@ import unittest
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -9,6 +10,14 @@ import pick_products
 
 
 class WechatNoteTests(unittest.TestCase):
+    def test_feishu_wait_for_field_is_available_on_client(self):
+        feishu = pick_products.Feishu({})
+        responses = iter([{}, {"图片名": [{"text": "N813"}]}])
+        feishu.get_record = lambda _record_id: next(responses)
+
+        with patch.object(pick_products.time, "sleep"):
+            self.assertEqual(feishu.wait_for_field("rec_test", "图片名"), "N813")
+
     def test_loads_text_and_child_page_images_from_latest_cache(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
