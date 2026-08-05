@@ -48,7 +48,7 @@ python3 pick_products.py bookmark
 python3 pick_products.py extension
 ```
 
-然后打开 Chrome `chrome://extensions/` → 开启「开发者模式」→「加载已解压的扩展程序」→ 选择项目里的 `chrome-extension` 文件夹。以后运行 `python3 pick_products.py` 会自动打开微购相册，扩展抓取完成后再打开选品工作台。供应商配置变化后重新运行上面的命令，并在扩展页刷新。
+然后打开 Chrome `chrome://extensions/` → 开启「开发者模式」→「加载已解压的扩展程序」→ 选择项目里的 `chrome-extension` 文件夹。以后运行 `python3 pick_products.py` 会自动打开微购相册，扩展抓取完成后再打开选品工作台；当前 `config.json` 的供货商配置会随本次运行自动传入，无需因新增供货商重新生成或刷新扩展。
 
 ## 日常挑品(每天)
 

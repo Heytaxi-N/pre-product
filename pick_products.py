@@ -2690,8 +2690,11 @@ def cmd_process_confirmed(config, progress, confirmed_path):
     print(f"\n{'='*50}\n✓ 全部完成, 共处理 {total} 个产品")
 
 
-def _open_szwego_in_chrome():
+def _open_szwego_in_chrome(config=None):
     url = "https://www.szwego.com/static/index.html"
+    if config:
+        suppliers = json.dumps(config.get("suppliers", {}), ensure_ascii=False)
+        url += "?" + urllib.parse.urlencode({"suppliers": suppliers})
     try:
         if sys.platform == "darwin":
             import subprocess
@@ -2722,11 +2725,11 @@ def wait_for_fresh_download(base, before_mtime=0, timeout=600):
     return None
 
 
-def refresh_daily_scrape(timeout=600):
+def refresh_daily_scrape(timeout=600, config=None):
     """打开已登录的微购相册, 由扩展抓取并返回最新 scrape_all 文件."""
     previous = pick_newest_download("scrape_all")
     before_mtime = previous.stat().st_mtime if previous else 0
-    _open_szwego_in_chrome()
+    _open_szwego_in_chrome(config)
     print("  已打开微购相册, Chrome 扩展应自动开始抓取")
     path = wait_for_fresh_download("scrape_all", before_mtime, timeout)
     if path:
@@ -2843,7 +2846,7 @@ def _write_chrome_extension(config, capture_script):
 4. 登录微购相册后打开 `https://www.szwego.com/static/index.html`。
 
 扩展会自动抓取 `config.json` 中的供货商，并下载 `scrape_all.json` 到 Chrome 的 Downloads 中转目录。运行挑品脚本时会自动归档到项目 `data/`。
-供应商配置变化后，重新运行 `python3 pick_products.py extension`，再在扩展页点刷新。
+运行 `python3 pick_products.py` 时会把当前 config.json 的供货商配置自动传给扩展,无需重复生成扩展。
 """,
         encoding="utf-8",
     )
@@ -2855,7 +2858,7 @@ def cmd_install_bookmark(config, open_install=True):
     suppliers_js = _load_all_supplier_ids(config)
     # 书签的 javascript: URL — 编码为 URI 保证在 href 里合法
     bookmarklet_body = r"""(async()=>{
-const SUP=__SUPPLIERS__;
+const SUP=Object.assign(__SUPPLIERS__, JSON.parse(new URLSearchParams(location.search).get('suppliers')||'{}'));
 const clean=it=>({goods_id:it.goods_id,title:it.title||'',imgsSrc:it.imgsSrc||[],time_stamp:it.time_stamp,update_time:it.update_time,videoUrl:it.videoUrl||it.videoURL||''});
 const filt=arr=>arr.filter(i=>!i.isTop&&!i.forwardTime&&i.parent_goods_id===i.goods_id).map(clean);
 const dailyClean=arr=>arr.filter(i=>!i.isTop).map(clean);
@@ -3284,7 +3287,7 @@ def main():
         return
 
     if mode in ("", "workbench") and not env_scrape:
-        fresh = refresh_daily_scrape()
+        fresh = refresh_daily_scrape(config=config)
         scrape_path = str(fresh or "")
     else:
         latest_scrape = _latest_scrape_path()

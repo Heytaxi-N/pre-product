@@ -51,6 +51,8 @@ class BookmarkletTests(unittest.TestCase):
                 )
                 self.assertNotIn("all?isFilter=true", body)
                 self.assertIn("const itemDate=it=>{const d=new Date(it.time_stamp)", body)
+                self.assertIn("Object.assign({", body)
+                self.assertIn("new URLSearchParams(location.search)", body)
                 self.assertNotIn("new Date(it.update_time||it.time_stamp)", body)
                 self.assertIn("pageHasDate", body)
                 self.assertIn("missesAfterDate", body)
