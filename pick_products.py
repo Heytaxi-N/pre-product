@@ -784,6 +784,37 @@ def _fallback_models(text, models):
     return result
 
 
+_HAT_PRODUCT_RE = re.compile(
+    r"(?:帽子|棒球帽|鸭舌帽|渔夫帽|遮阳帽|防晒帽|针织帽|毛线帽|冷帽|"
+    r"户外帽|贝雷帽|登山帽|礼帽|盆帽|空顶帽|帽款|帽类|"
+    r"(?<!连)帽(?=$|[\s，。,:：/]))"
+)
+_EXPLICIT_SIZE_RE = re.compile(
+    r"(?:尺码|帽围|头围|尺寸|规格)\s*[:：]?\s*"
+    r"(?:均码|通码|自由码|F码|XXXL?|XXL?|XL|L|M|S|XS|"
+    r"\d{2,3}(?:\.\d+)?(?:\s*[-~～]\s*\d{2,3}(?:\.\d+)?)?)",
+    re.I,
+)
+
+
+def _add_hat_default_size(text, matches, models):
+    source = str(text or "")
+    if (
+        not _HAT_PRODUCT_RE.search(source)
+        or any(group["name"].startswith("尺码") for group in matches)
+        or _EXPLICIT_SIZE_RE.search(source)
+    ):
+        return matches
+    size_group = next(
+        (group for group in models
+         if group["name"] == "尺码" and "均码" in group["values"]),
+        None,
+    )
+    if not size_group:
+        return matches
+    return [*matches, {"name": "尺码", "values": ["均码"]}]
+
+
 def match_weidian_models(text, ai_config, models=None):
     """按文案识别已有型号; 所有输出必须来自微店型号白名单."""
     models = [group for group in (models or load_weidian_models())
@@ -792,7 +823,7 @@ def match_weidian_models(text, ai_config, models=None):
     base_url = (ai_config or {}).get("base_url", "").rstrip("/")
     api_key = (ai_config or {}).get("api_key", "")
     if not (base_url and api_key and models):
-        return fallback
+        return _add_hat_default_size(text, fallback, models)
     prompt = (
         "根据商品文案识别已有型号。只返回文案明确提到的型号,不能猜测或编造。\n"
         "颜色可以把复杂颜色归并到候选中的基础色,例如玫瑰红归并为红色;其他规格必须严格匹配候选值。\n"
@@ -838,11 +869,12 @@ def match_weidian_models(text, ai_config, models=None):
             for value in group["values"]:
                 if value not in target["values"]:
                     target["values"].append(value)
-        return [by_name[_category_key(group["name"])] for group in models
-                if _category_key(group["name"]) in by_name]
+        matched = [by_name[_category_key(group["name"])] for group in models
+                   if _category_key(group["name"]) in by_name]
+        return _add_hat_default_size(text, matched, models)
     except Exception as e:
         print(f"  ⚠ 微店型号识别失败, 使用白名单文字命中: {str(e)[:100]}")
-        return fallback
+        return _add_hat_default_size(text, fallback, models)
 
 
 def format_model_field(matches):
@@ -975,6 +1007,18 @@ class Feishu:
             raise RuntimeError(f"飞书读取失败: {data}")
         return data["data"]["record"]["fields"]
 
+    def update_record(self, record_id, fields):
+        url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
+            f"{self.cfg['base_id']}/tables/{self.cfg['table_id']}/records/{record_id}"
+        )
+        data = http_put_json(
+            url, {"fields": fields}, headers=self._auth_header()
+        )
+        if data.get("code") != 0:
+            raise RuntimeError(f"飞书更新失败: {data}")
+        return data["data"]["record"]
+
     def list_records(self, page_size=500):
         """读取多维表格记录, 只读并自动翻页."""
         base = (
@@ -1101,6 +1145,72 @@ def _feishu_text(value):
             if value.get(key) is not None:
                 return _feishu_text(value[key])
     return ""
+
+
+def _feishu_field_matches(actual, expected):
+    if isinstance(expected, list):
+        actual_items = actual if isinstance(actual, list) else [actual]
+        return [
+            _feishu_text(item).strip() for item in actual_items
+        ] == [str(item).strip() for item in expected]
+    return _feishu_text(actual).strip() == str(expected).strip()
+
+
+def fill_missing_feishu_fields(feishu, fs_config, ai_config):
+    """给「待编辑」且分类/型号为空的记录补齐分类和型号, 写后回读校验."""
+    status_field = fs_config.get("status_field", "状态")
+    info_field = fs_config.get("info_field", "信息")
+    category_field = fs_config.get("category_field", "分类")
+    model_field = fs_config.get("model_field", "型号")
+    category_options = feishu.get_field_options(category_field)
+    result = {"scanned": 0, "matched": 0, "updated": 0, "no_match": 0, "failed": []}
+
+    for record in feishu.list_records():
+        result["scanned"] += 1
+        fields = record.get("fields") or {}
+        if (
+            _feishu_text(fields.get(status_field)).strip() != "待编辑"
+            or not _feishu_text(fields.get(info_field)).strip()
+            or _feishu_text(fields.get(category_field)).strip()
+            or _feishu_text(fields.get(model_field)).strip()
+        ):
+            continue
+        result["matched"] += 1
+        record_id = record.get("record_id") or record.get("id")
+        if not record_id:
+            result["failed"].append("缺少 record_id")
+            continue
+        try:
+            current = feishu.get_record(record_id)
+            if (
+                _feishu_text(current.get(status_field)).strip() != "待编辑"
+                or not _feishu_text(current.get(info_field)).strip()
+                or _feishu_text(current.get(category_field)).strip()
+                or _feishu_text(current.get(model_field)).strip()
+            ):
+                continue
+            auto_fields, _, _ = build_auto_fields(
+                current[info_field], ai_config, fs_config, category_options
+            )
+            updates = {
+                name: auto_fields[name]
+                for name in (category_field, model_field)
+                if auto_fields.get(name)
+            }
+            if not updates:
+                result["no_match"] += 1
+                continue
+            feishu.update_record(record_id, updates)
+            verified = feishu.get_record(record_id)
+            if not all(
+                _feishu_field_matches(verified.get(name), value)
+                for name, value in updates.items()
+            ):
+                raise RuntimeError("写入后回读字段不一致")
+            result["updated"] += 1
+        except Exception as exc:
+            result["failed"].append(f"{record_id}: {exc}")
+    return result
 
 
 def _feishu_record_time(record):
@@ -3477,6 +3587,23 @@ def cmd_sync_categories(config):
         print(f"  移除 {len(result['removed'])} 个不在分类树中的旧选项")
 
 
+def cmd_fill_fields(config):
+    fs_cfg = config.get("feishu") or {}
+    if not all(fs_cfg.get(key) for key in ("app_id", "app_secret", "base_id", "table_id")):
+        raise RuntimeError("填充飞书分类/型号需要完整的 feishu 配置")
+    result = fill_missing_feishu_fields(
+        Feishu(fs_cfg), fs_cfg, config.get("ai_vision") or {}
+    )
+    print(
+        f"✓ 扫描 {result['scanned']} 条, 命中 {result['matched']} 条, "
+        f"更新 {result['updated']} 条, 无可靠匹配 {result['no_match']} 条"
+    )
+    for failure in result["failed"]:
+        print(f"  ❌ {failure}")
+    if result["failed"]:
+        raise RuntimeError(f"{len(result['failed'])} 条记录更新失败")
+
+
 def _parse_batch_targets(mode, args):
     """把高级模式位置参数解析为去重后的目标元组, 保留首次出现顺序."""
     if mode == "run":
@@ -3542,7 +3669,7 @@ def main():
     # 位置参数: [mode] [模式参数...]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
     mode = ""
-    if positional and positional[0] in ("preview", "workbench", "process", "run", "bookmark", "extension", "anchor", "range", "refresh_keywords", "sync_categories", "wx_note"):
+    if positional and positional[0] in ("preview", "workbench", "process", "run", "bookmark", "extension", "anchor", "range", "refresh_keywords", "sync_categories", "fill_fields", "wx_note"):
         mode = positional.pop(0)
     mode_args = list(positional)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
@@ -3580,6 +3707,14 @@ def main():
             cmd_sync_categories(config)
         except Exception as e:
             print(f"❌ 同步飞书分类失败: {e}")
+            sys.exit(1)
+        return
+
+    if mode == "fill_fields":
+        try:
+            cmd_fill_fields(config)
+        except Exception as e:
+            print(f"❌ 填充飞书分类/型号失败: {e}")
             sys.exit(1)
         return
 
