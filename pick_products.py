@@ -1,5 +1,5 @@
 """
-微购相册挑品脚本 — 从供货商拉取产品、下载图片、AI分类排序、建文件夹、写飞书
+微购相册挑品脚本 — 从供货商拉取产品、按条目顺序下载图片、建文件夹、写飞书
 用法:
   # 让 Claude Code 用浏览器抓当天上新, 保存为 scrape.json (无需登录)
   # 然后运行:
@@ -9,6 +9,7 @@ import json, math, os, sys, time, shutil, base64, hashlib, tempfile, re, threadi
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
+from html.parser import HTMLParser
 import urllib.request, urllib.parse, urllib.error
 
 SCRIPT_DIR = Path(__file__).parent
@@ -17,7 +18,11 @@ PROGRESS_FILE = SCRIPT_DIR / "progress.json"
 FEISHU_PENDING_FILE = SCRIPT_DIR / "feishu_pending.json"
 WEIDIAN_CATEGORIES_FILE = SCRIPT_DIR / "data" / "weidian_categories.json"
 WEIDIAN_MODELS_FILE = SCRIPT_DIR / "data" / "weidian_models.json"
+LOCAL_CATEGORY_KEYWORDS_FILE = SCRIPT_DIR / "data" / "local_category_keywords.json"
 OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
+WECHAT_NOTE_TEMP_ROOT = Path(
+    "/Users/nick/Library/Containers/com.tencent.xinWeiXin2/Data/Documents/xwechat_files"
+)
 TMP_ROOT = Path(tempfile.gettempdir()) / "weidian_pick"  # 临时/缓存, 不落在商品图里
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0"))  # 0 = 不限, 也可 config.json 里配 defaults.max_products
 BOOKMARKLET_FILE = SCRIPT_DIR / "install_bookmark.html"
@@ -41,6 +46,14 @@ def http_post_json(url, payload, headers=None):
     if headers:
         hdr.update(headers)
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=hdr, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+def http_put_json(url, payload, headers=None):
+    hdr = {"Content-Type": "application/json"}
+    if headers:
+        hdr.update(headers)
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=hdr, method="PUT")
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read())
 
@@ -239,7 +252,11 @@ def download_product_images(product_items, tmp_dir):
             dest = tmp_dir / fname
             if not dest.exists():
                 try:
-                    dest.write_bytes(http_get_bytes(clean_url))
+                    source_path = Path(clean_url)
+                    if source_path.is_file():
+                        shutil.copy2(source_path, dest)
+                    else:
+                        dest.write_bytes(http_get_bytes(clean_url))
                 except Exception as e:
                     print(f"  下载失败 {clean_url}: {e}")
                     failed = True
@@ -264,7 +281,159 @@ def download_product_images(product_items, tmp_dir):
     return paths
 
 
-# ── AI 分类 ───────────────────────────────────────────
+# ── 微信笔记缓存输入 ─────────────────────────────────
+class _WxNoteTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def _newline(self):
+        if self.parts and self.parts[-1] != "\n":
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("br", "hr", "p", "div", "li"):
+            self._newline()
+
+    def handle_endtag(self, tag):
+        if tag in ("p", "div", "li"):
+            self._newline()
+
+    def handle_data(self, data):
+        self.parts.append(data.replace("\xa0", " "))
+
+    def text(self):
+        lines = [re.sub(r"[ \t]+", " ", line).strip()
+                 for line in "".join(self.parts).splitlines()]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+_WX_IMAGE_RE = re.compile(r"^微信图片_(\d+)_(\d+)\.(?:jpg|jpeg|png|webp)$", re.I)
+
+
+def _wechat_cache_mtime(html_path):
+    mtimes = [html_path.stat().st_mtime]
+    mtimes.extend(
+        path.stat().st_mtime
+        for path in html_path.parent.iterdir()
+        if _WX_IMAGE_RE.match(path.name) and path.is_file()
+    )
+    return max(mtimes)
+
+
+def _jpeg_size(path):
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    index = 2
+    sof_markers = set(range(0xC0, 0xC4)) | set(range(0xC5, 0xC8)) | set(range(0xC9, 0xCC)) | set(range(0xCD, 0xD0))
+    while index + 3 < len(data):
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        while index < len(data) and data[index] == 0xFF:
+            index += 1
+        marker = data[index]
+        index += 1
+        if marker in (0xD8, 0xD9):
+            continue
+        length = int.from_bytes(data[index:index + 2], "big")
+        if marker in sof_markers and index + 7 <= len(data):
+            height = int.from_bytes(data[index + 3:index + 5], "big")
+            width = int.from_bytes(data[index + 5:index + 7], "big")
+            return width, height
+        index += length
+    return None
+
+
+def _remove_wechat_thumbnail_pairs(images):
+    kept = []
+    index = 0
+    while index < len(images):
+        current = _WX_IMAGE_RE.match(images[index].name)
+        following = _WX_IMAGE_RE.match(images[index + 1].name) if index + 1 < len(images) else None
+        if current and following and int(following.group(2)) - int(current.group(2)) == 2:
+            small, large = _jpeg_size(images[index]), _jpeg_size(images[index + 1])
+            if small and large:
+                small_ratio = small[0] / small[1]
+                large_ratio = large[0] / large[1]
+                if small[0] <= 424 and large[0] > small[0] and abs(small_ratio - large_ratio) < 0.02:
+                    kept.append(images[index + 1])
+                    index += 2
+                    continue
+        kept.append(images[index])
+        index += 1
+    return kept
+
+
+def _wechat_images_for_html(html_path, expected_image_count=0):
+    images = []
+    for path in html_path.parent.iterdir():
+        match = _WX_IMAGE_RE.match(path.name)
+        if match and path.is_file():
+            images.append(path)
+    if not images:
+        raise RuntimeError(f"笔记缓存没有找到配套图片: {html_path}")
+    by_mtime = sorted(images, key=lambda path: path.stat().st_mtime)
+    bursts = [[]]
+    for path in by_mtime:
+        if bursts[-1] and path.stat().st_mtime - bursts[-1][-1].stat().st_mtime > 60:
+            bursts.append([])
+        bursts[-1].append(path)
+    images = sorted(
+        bursts[-1],
+        key=lambda path: tuple(int(value) for value in _WX_IMAGE_RE.match(path.name).groups()),
+    )
+    if expected_image_count and len(images) >= expected_image_count * 2:
+        # ponytail: 微信当前缓存按对象顺序先写缩略图/原图, 对象映射未公开时用 HTML 数量截断历史尾巴。
+        images = images[:expected_image_count * 2]
+    # ponytail: 60 秒素材时间簇是当前 NoteCache 的最小可验证边界;若缓存暴露对象到图片映射再替换启发式。
+    images = sorted(
+        images,
+        key=lambda path: tuple(int(value) for value in _WX_IMAGE_RE.match(path.name).groups()),
+    )
+    return _remove_wechat_thumbnail_pairs(images)
+
+
+def load_wechat_note(cache_root=WECHAT_NOTE_TEMP_ROOT):
+    """读取当前微信笔记对应的最新本地缓存;主笔记缓存已包含其子页面素材."""
+    html_paths = sorted(
+        Path(cache_root).glob("*/business/favorite/temp/*.htm"),
+        key=_wechat_cache_mtime,
+        reverse=True,
+    )
+    for html_path in html_paths:
+        try:
+            html = html_path.read_text(encoding="utf-8")
+            expected_image_count = len(re.findall(
+                r"<object\b[^>]*data-type=[\"']2[\"'][^>]*>", html,
+                re.I,
+            ))
+            images = _wechat_images_for_html(html_path, expected_image_count)
+        except (OSError, UnicodeError, RuntimeError):
+            continue
+        parser = _WxNoteTextParser()
+        parser.feed(html)
+        modified = max([html_path.stat().st_mtime] + [p.stat().st_mtime for p in images])
+        digest = hashlib.sha256(html.encode("utf-8")).hexdigest()[:20]
+        stamp = int(modified * 1000)
+        return {
+            "html_path": html_path,
+            "item": {
+                "goods_id": f"wx_{digest}",
+                "title": parser.text(),
+                "imgsSrc": [str(path) for path in images],
+                "time_stamp": stamp,
+                "update_time": stamp,
+            },
+        }
+    raise RuntimeError(f"没有找到可用微信笔记缓存: {cache_root}")
+
+
+# ── 旧版图片分类能力（默认流程不调用） ─────────────────────
 CATEGORIES = ["合图", "价格图", "产品包装图", "模特图", "官方介绍图", "细节图", "尺码表", "其他"]
 
 # 常见服饰颜色词(复合色在前, 便于优先匹配整词)
@@ -390,7 +559,33 @@ def _category_key(text):
     return re.sub(r"[\s【】\[\]（）()、，,/\\_\-]+", "", str(text or "")).lower()
 
 
-def _fallback_categories(text, categories):
+def build_feishu_category_options(categories=None, prefix="品牌分类-"):
+    """按微店分类树生成飞书分类选项, 品牌子项加前缀并去重."""
+    categories = categories or load_weidian_categories()
+    excluded = {"未分类", "店长推荐", "品牌分类"}
+    options = []
+    seen = set()
+    for row in categories:
+        name = str(row.get("name", "")).strip()
+        if not name or name in excluded:
+            continue
+        option = f"{prefix}{name}" if row.get("parent_id") else name
+        if option not in seen:
+            seen.add(option)
+            options.append(option)
+    return options
+
+
+def load_local_category_keywords(path=LOCAL_CATEGORY_KEYWORDS_FILE):
+    raw = load_json_or(Path(path), {})
+    keywords = raw.get("keywords", {}) if isinstance(raw, dict) else {}
+    return {
+        str(name): [str(word).strip() for word in words if str(word).strip()]
+        for name, words in keywords.items() if isinstance(words, list)
+    }
+
+
+def _fallback_categories(text, categories, local_keywords=None):
     source = _category_key(text)
     matched = []
     aliases = {
@@ -402,6 +597,9 @@ def _fallback_categories(text, categories):
         "【男装】猛男点这里": ("男装", "男款", "男士"),
         "【女装】美女看这里": ("女装", "女款", "女士"),
     }
+    local_keywords = local_keywords if local_keywords is not None else load_local_category_keywords()
+    for name, words in local_keywords.items():
+        aliases[name] = tuple(dict.fromkeys((*aliases.get(name, ()), *words)))
     for row in categories:
         name = row["name"]
         if name in ("未分类", "店长推荐", "品牌分类"):
@@ -413,7 +611,7 @@ def _fallback_categories(text, categories):
 
 
 def match_weidian_categories(text, ai_config, categories=None):
-    """按文案语义从微店分类中多选; AI 失败时只保留明确的文字命中."""
+    """按文案语义从微店分类中多选, 并保留明确的文字命中."""
     categories = categories or load_weidian_categories()
     names = [row["name"] for row in categories
              if row["name"] not in ("未分类", "店长推荐", "品牌分类")]
@@ -444,9 +642,11 @@ def match_weidian_categories(text, ai_config, categories=None):
             name = allowed.get(_category_key(item))
             if name and name not in result and name not in ("未分类", "店长推荐"):
                 result.append(name)
-        return result or fallback
+        selected = set(result) | set(fallback)
+        return [name for name in names if name in selected]
     except Exception as e:
-        print(f"  ⚠ 微店分类语义识别失败, 使用明确文字命中: {str(e)[:100]}")
+        detail = "大模型额度/付费状态异常(HTTP 402)" if "HTTP Error 402" in str(e) else str(e)[:100]
+        print(f"  ⚠ 微店分类语义识别失败({detail}), 使用本地关键词命中")
         return fallback
 
 
@@ -473,6 +673,32 @@ def load_weidian_models(path=WEIDIAN_MODELS_FILE):
 
 def _model_value_key(value):
     return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _explicit_color_alias(text, alias):
+    if len(alias) > 1:
+        return alias in text
+    return bool(
+        re.search(
+            rf"(?<![\u4e00-\u9fff]){re.escape(alias)}(?![\u4e00-\u9fff])",
+            text,
+        )
+        or re.search(rf"[深浅淡亮暗]{re.escape(alias)}色?", text)
+    )
+
+
+def _covered_by_longer_value(text, value, values):
+    spans = [match.span() for match in re.finditer(re.escape(value), text)]
+    longer_spans = [
+        match.span()
+        for other in values
+        if other != value and value in other
+        for match in re.finditer(re.escape(other), text)
+    ]
+    return bool(spans) and all(
+        any(start >= left and end <= right for left, right in longer_spans)
+        for start, end in spans
+    )
 
 
 _BASE_COLOR_ALIASES = {
@@ -523,7 +749,9 @@ def _fallback_models(text, models):
             ):
                 values.append(value)
         for base, aliases in _BASE_COLOR_ALIASES.items():
-            if "颜色" in group["name"] and any(alias in source for alias in aliases):
+            if "颜色" in group["name"] and any(
+                _explicit_color_alias(source, alias) for alias in aliases
+            ):
                 values.extend(_resolve_model_value(group["name"], base, group["values"]))
         unique = []
         allowed = {_model_value_key(value): value for value in group["values"]}
@@ -531,6 +759,16 @@ def _fallback_models(text, models):
             value = allowed.get(_model_value_key(value), value)
             if value in group["values"] and value not in unique:
                 unique.append(value)
+        unique = [
+            value for value in unique
+            if not any(
+                value != other
+                and re.search(r"[\u4e00-\u9fff]", value)
+                and value in other
+                and _covered_by_longer_value(source, value, unique)
+                for other in unique
+            )
+        ]
         if unique:
             def source_position(value):
                 patterns = [value]
@@ -548,7 +786,8 @@ def _fallback_models(text, models):
 
 def match_weidian_models(text, ai_config, models=None):
     """按文案识别已有型号; 所有输出必须来自微店型号白名单."""
-    models = models or load_weidian_models()
+    models = [group for group in (models or load_weidian_models())
+              if group["name"] != "类别"]
     fallback = _fallback_models(text, models)
     base_url = (ai_config or {}).get("base_url", "").rstrip("/")
     api_key = (ai_config or {}).get("api_key", "")
@@ -570,6 +809,10 @@ def match_weidian_models(text, ai_config, models=None):
         start, end = answer.find("{"), answer.rfind("}")
         data = json.loads(answer[start:end + 1]) if start >= 0 else {}
         groups = {_category_key(group["name"]): group for group in models}
+        fallback_by_name = {
+            _category_key(group["name"]): set(group["values"])
+            for group in fallback
+        }
         matched = []
         for item in data.get("models", []):
             if not isinstance(item, dict):
@@ -580,7 +823,12 @@ def match_weidian_models(text, ai_config, models=None):
             values = []
             for value in item.get("values", []):
                 for resolved in _resolve_model_value(group["name"], value, group["values"]):
-                    if resolved not in values:
+                    if (
+                        (group["name"] != "颜色"
+                         or resolved in fallback_by_name.get(
+                             _category_key(group["name"]), set()))
+                        and resolved not in values
+                    ):
                         values.append(resolved)
             if values:
                 matched.append({"name": group["name"], "values": values})
@@ -604,12 +852,18 @@ def format_model_field(matches):
 
 
 def parse_cost_price(text):
-    """提取💰后的成本价, 找不到返回 None."""
-    match = re.search(r"💰\s*[:：]?\s*(\d+(?:\.\d+)?)", str(text or ""))
-    if not match:
-        return None
-    value = float(match.group(1))
-    return int(value) if value.is_integer() else value
+    """提取💰或P/p后的成本价, 找不到返回 None."""
+    source = str(text or "")
+    patterns = (
+        r"💰\s*[:：]?\s*(\d+(?:\.\d+)?)",
+        r"(?<![A-Za-z0-9])p\s*[:：]?\s*(\d+(?:\.\d+)?)(?![A-Za-z0-9])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, source, re.I)
+        if match:
+            value = float(match.group(1))
+            return int(value) if value.is_integer() else value
+    return None
 
 
 def calculate_sale_price(cost):
@@ -721,9 +975,31 @@ class Feishu:
             raise RuntimeError(f"飞书读取失败: {data}")
         return data["data"]["record"]["fields"]
 
-    def get_field_options(self, field_name):
-        if field_name in self.field_options:
-            return self.field_options[field_name]
+    def list_records(self, page_size=500):
+        """读取多维表格记录, 只读并自动翻页."""
+        base = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
+            f"{self.cfg['base_id']}/tables/{self.cfg['table_id']}/records"
+        )
+        records = []
+        page_token = ""
+        while True:
+            params = {"page_size": str(page_size)}
+            if page_token:
+                params["page_token"] = page_token
+            url = f"{base}?{urllib.parse.urlencode(params)}"
+            data = http_get_json(url, headers=self._auth_header())
+            if data.get("code") != 0:
+                raise RuntimeError(f"飞书记录读取失败: {data}")
+            page = data.get("data", {})
+            records.extend(page.get("items", []))
+            if not page.get("has_more"):
+                return records
+            page_token = page.get("page_token", "")
+            if not page_token:
+                return records
+
+    def get_field(self, field_name):
         url = (
             f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
             f"{self.cfg['base_id']}/tables/{self.cfg['table_id']}/fields?page_size=100"
@@ -738,6 +1014,12 @@ class Feishu:
         )
         if not field:
             raise RuntimeError(f"飞书字段不存在: {field_name}")
+        return field
+
+    def get_field_options(self, field_name):
+        if field_name in self.field_options:
+            return self.field_options[field_name]
+        field = self.get_field(field_name)
         if field.get("type") != 4:
             raise RuntimeError(f"飞书字段不是多选类型: {field_name}")
         options = [
@@ -746,6 +1028,46 @@ class Feishu:
         ]
         self.field_options[field_name] = {name for name in options if name}
         return self.field_options[field_name]
+
+    def update_field_options(self, field_name, options):
+        field = self.get_field(field_name)
+        if field.get("type") != 4:
+            raise RuntimeError(f"飞书字段不是多选类型: {field_name}")
+        names = list(dict.fromkeys(str(name).strip() for name in options if str(name).strip()))
+        property_data = dict(field.get("property") or {})
+        property_data["options"] = [{"name": name} for name in names]
+        url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
+            f"{self.cfg['base_id']}/tables/{self.cfg['table_id']}/fields/{field['field_id']}"
+        )
+        data = http_put_json(
+            url,
+            {"field_name": field_name, "type": 4, "property": property_data},
+            headers=self._auth_header(),
+        )
+        if data.get("code") != 0:
+            raise RuntimeError(f"飞书字段选项更新失败: {data}")
+        self.field_options.pop(field_name, None)
+        return self.get_field_options(field_name)
+
+
+def sync_category_field_options(feishu, fs_config):
+    field_name = fs_config.get("category_field", "分类")
+    options = build_feishu_category_options(
+        prefix=fs_config.get("category_child_prefix", "品牌分类-")
+    )
+    current = feishu.get_field_options(field_name)
+    if current == set(options):
+        return {"field": field_name, "added": [], "removed": [], "options": options}
+    verified = feishu.update_field_options(field_name, options)
+    if verified != set(options):
+        raise RuntimeError(f"飞书分类选项回读不一致: 期望 {len(options)} 个, 实际 {len(verified)} 个")
+    return {
+        "field": field_name,
+        "added": sorted(set(options) - current),
+        "removed": sorted(current - set(options)),
+        "options": options,
+    }
 
     def wait_for_field(self, record_id, field_name, timeout=90):
         """轮询等待自动生成字段(如"图片名")出现"""
@@ -762,6 +1084,99 @@ class Feishu:
                 return val
             time.sleep(2)
         raise RuntimeError(f"等待字段 {field_name} 超时")
+
+
+_KEYWORD_STOPWORDS = {
+    "商品", "新款", "现货", "上新", "专柜", "正品", "男女", "均码", "图片", "颜色",
+    "尺码", "发货", "到货", "推荐", "下单", "链接", "质量", "面料", "细节", "同款",
+}
+
+
+def _feishu_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "、".join(_feishu_text(item) for item in value if _feishu_text(item))
+    if isinstance(value, dict):
+        for key in ("text", "name", "value"):
+            if value.get(key) is not None:
+                return _feishu_text(value[key])
+    return ""
+
+
+def _feishu_record_time(record):
+    fields = record.get("fields") or {}
+    value = (fields.get("创建时间") or record.get("created_time") or
+             record.get("last_modified_time"))
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            return float(value) / 1000
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return 0
+
+
+def build_local_category_keywords(records, categories, info_field="信息",
+                                  category_field="分类", days=30, now=None):
+    """从近期已分类文案提取重复中文词, 仅挂到已有根分类."""
+    cutoff = (now or time.time()) - days * 86400
+    roots = {
+        row["name"] for row in categories
+        if not row.get("parent_id") and row["name"] not in ("未分类", "店长推荐", "品牌分类")
+    }
+    counts = {name: {} for name in roots}
+    for record in records:
+        if _feishu_record_time(record) < cutoff:
+            continue
+        fields = record.get("fields") or {}
+        info = _feishu_text(fields.get(info_field))
+        raw_labels = fields.get(category_field) or []
+        if not isinstance(raw_labels, list):
+            raw_labels = [raw_labels]
+        label_text = "、".join(_feishu_text(value).strip() for value in raw_labels)
+        labels = {root for root in roots if root in label_text}
+        if not info or not labels:
+            continue
+        seen_words = set()
+        for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", info):
+            for size in (2, 3, 4):
+                for index in range(len(chunk) - size + 1):
+                    word = chunk[index:index + size]
+                    if word in _KEYWORD_STOPWORDS or word in seen_words:
+                        continue
+                    seen_words.add(word)
+                    for label in labels:
+                        counts[label][word] = counts[label].get(word, 0) + 1
+    category_hits = {}
+    for words in counts.values():
+        for word in words:
+            category_hits[word] = category_hits.get(word, 0) + 1
+    return {
+        name: [word for word, count in sorted(words.items(), key=lambda item: (-item[1], item[0]))
+               if count >= 2 and category_hits.get(word, 0) <= 2][:80]
+        for name, words in counts.items() if any(count >= 2 for count in words.values())
+    }
+
+
+def refresh_local_category_keywords(feishu, fs_config, days=30):
+    categories = load_weidian_categories()
+    records = feishu.list_records()
+    keywords = build_local_category_keywords(
+        records, categories,
+        fs_config.get("info_field", "信息"),
+        fs_config.get("category_field", "分类"),
+        days=days,
+    )
+    # 本地已有值视为人工维护内容, 刷新时保留.
+    keywords = {**keywords, **load_local_category_keywords()}
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "days": days,
+        "records": len(records),
+        "keywords": keywords,
+    }
+    save_json(LOCAL_CATEGORY_KEYWORDS_FILE, payload)
+    return payload
 
 
 # ── 输出文件夹 ────────────────────────────────────────
@@ -1122,7 +1537,7 @@ def _video_frame_data_url(path):
 
 def build_classify_preview_html(
         supplier_name, prepared, out_path, review_label="", confirm_base="分类确认"):
-    """排序预览: 按 AI 排好的顺序展示每张图, 拖拽重排 + 删除 + 标记尺码表。
+    """图片预览: 按当前处理顺序展示每张图, 拖拽重排 + 删除 + 标记尺码表。
     导出 分类确认.json = {supplier, prods:[{order:[存活id新序], sizes:[标为尺码表的id]}]}。
     prepared 每项含 sorted_imgs:[(path,cat,score,color)] (已排好序)。"""
     prods = []
@@ -1372,7 +1787,7 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
     if review is None:
         review = os.environ.get("SKIP_REVIEW", "") not in ("1", "true", "yes")
 
-    # Phase A: 下载 → 去重 → 分类 → 排序, 暂存(临时目录先不删)
+    # Phase A: 下载 → 去重 → 保持条目顺序, 暂存(临时目录先不删)
     prepared = []
     for gi, group in enumerate(groups, 1):
         group_asc = sorted(group, key=order_key)
@@ -1403,18 +1818,11 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
         if len(uniq) < len(images):
             print(f"  去重: {len(images)} → {len(uniq)} 张")
         print(f"  下载 {len(uniq)} 张")
-        # 颜色优先按文案判(2个色就分2类), 文案没有再交给 AI 看图
-        palette = extract_colors(combined_text)
-        if palette:
-            print(f"  文案颜色: {'/'.join(palette)}")
-        classified = classify_images_ai(ai_cfg, uniq, palette=palette)
-        if classified is None:
-            sorted_imgs = [
-                (p, "视频" if p.suffix.lower() in VIDEO_EXTS else "其他", 0, "")
-                for p in uniq
-            ]
-        else:
-            sorted_imgs = sort_by_new_rule(classified)
+        # 默认按下载顺序保留图片; 图片分类函数保留为独立旧能力, 以后需要时再接回流程。
+        sorted_imgs = [
+            (p, "视频" if p.suffix.lower() in VIDEO_EXTS else "其他", 0, "")
+            for p in uniq
+        ]
         prepared.append({"gi": gi, "latest_time": latest_time, "combined_text": combined_text,
                          "goods_ids": [it["goods_id"] for it in group],
                          "tmp_dir": tmp_dir, "sorted_imgs": sorted_imgs, "final": sorted_imgs})
@@ -1509,9 +1917,8 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                     save_json(FEISHU_PENDING_FILE, feishu_pending)
                     try:
                         category_options = (
-                            feishu.get_field_options(
-                                fs_cfg.get("category_field", "分类")
-                            )
+                            sync_category_field_options(feishu, fs_cfg)
+                            ["options"]
                             if hasattr(feishu, "get_field_options") else None
                         )
                         auto_fields, matched_categories, cost = build_auto_fields(
@@ -2809,6 +3216,31 @@ def _process_confirmed_file(config, progress, confirmed):
             pass
 
 
+def cmd_wechat_note(config, progress):
+    """读取当前微信笔记缓存, 复用排序预览后写飞书并建产品文件夹."""
+    fs_cfg = config.get("feishu") or {}
+    required = ("app_id", "app_secret", "base_id", "table_id")
+    if not all(fs_cfg.get(key) for key in required):
+        raise RuntimeError("微信笔记流程需要完整的 feishu 配置")
+    note = load_wechat_note()
+    item = note["item"]
+    album_id = f"wechat:{note['html_path'].parents[3].name}"
+    state = _ensure_progress_state(album_id, [item], progress)
+    if _progress_item_status(item, state) == "done":
+        print(f"✓ 当前微信笔记已处理过: {note['html_path'].name}")
+        return 0
+    print(f"✓ 微信笔记缓存: {note['html_path']}")
+    print(f"  文案 {len(item['title'])} 字 · 图片 {len(item['imgsSrc'])} 张（含子页面素材）")
+    feishu = Feishu(fs_cfg)
+    ai_cfg = config.get("ai_vision") or {}
+    return process_groups(
+        "微信笔记", album_id, [[item]], progress, feishu, fs_cfg, ai_cfg,
+        advance_progress=True, review=True, order_key=lambda value: value["time_stamp"],
+        review_id=item["goods_id"], review_label="微信笔记",
+        raise_interrupt=True,
+    )
+
+
 def _load_all_supplier_ids(config):
     """把 config.suppliers 展开成 JS 字面量字符串, 用于生成书签."""
     return json.dumps(config.get("suppliers", {}), ensure_ascii=False)
@@ -3019,6 +3451,33 @@ def _apply_defaults(config):
         MAX_PRODUCTS = int(d["max_products"])
 
 
+def cmd_refresh_keywords(config):
+    fs_cfg = config.get("feishu") or {}
+    if not all(fs_cfg.get(key) for key in ("app_id", "app_secret", "base_id", "table_id")):
+        raise RuntimeError("刷新本地关键词需要完整的 feishu 配置")
+    days = int(os.environ.get("KEYWORD_DAYS", "30"))
+    payload = refresh_local_category_keywords(Feishu(fs_cfg), fs_cfg, days=days)
+    print(
+        f"✓ 已读取飞书 {payload['records']} 条记录, "
+        f"生成 {sum(len(words) for words in payload['keywords'].values())} 个本地分类关键词"
+    )
+    print(f"  缓存: {LOCAL_CATEGORY_KEYWORDS_FILE}")
+
+
+def cmd_sync_categories(config):
+    fs_cfg = config.get("feishu") or {}
+    if not all(fs_cfg.get(key) for key in ("app_id", "app_secret", "base_id", "table_id")):
+        raise RuntimeError("同步飞书分类选项需要完整的 feishu 配置")
+    result = sync_category_field_options(Feishu(fs_cfg), fs_cfg)
+    print(
+        f"✓ 飞书「{result['field']}」已同步 {len(result['options'])} 个分类选项"
+    )
+    if result["added"]:
+        print(f"  新增 {len(result['added'])} 个")
+    if result["removed"]:
+        print(f"  移除 {len(result['removed'])} 个不在分类树中的旧选项")
+
+
 def _parse_batch_targets(mode, args):
     """把高级模式位置参数解析为去重后的目标元组, 保留首次出现顺序."""
     if mode == "run":
@@ -3084,7 +3543,7 @@ def main():
     # 位置参数: [mode] [模式参数...]  (config.json 之类的 .json 不算位置参数)
     positional = [a for a in sys.argv[1:] if not a.endswith(".json")]
     mode = ""
-    if positional and positional[0] in ("preview", "workbench", "process", "run", "bookmark", "extension", "anchor", "range"):
+    if positional and positional[0] in ("preview", "workbench", "process", "run", "bookmark", "extension", "anchor", "range", "refresh_keywords", "sync_categories", "wx_note"):
         mode = positional.pop(0)
     mode_args = list(positional)
     supplier_arg = positional[0] if len(positional) >= 1 else ""
@@ -3108,6 +3567,34 @@ def main():
 
     if mode == "extension":
         cmd_install_extension(config); return
+
+    if mode == "refresh_keywords":
+        try:
+            cmd_refresh_keywords(config)
+        except Exception as e:
+            print(f"❌ 刷新本地关键词失败: {e}")
+            sys.exit(1)
+        return
+
+    if mode == "sync_categories":
+        try:
+            cmd_sync_categories(config)
+        except Exception as e:
+            print(f"❌ 同步飞书分类失败: {e}")
+            sys.exit(1)
+        return
+
+    if mode == "wx_note":
+        try:
+            count = cmd_wechat_note(config, progress)
+        except KeyboardInterrupt:
+            print("\n已取消, 未创建飞书记录或产品文件夹")
+            return
+        except Exception as e:
+            print(f"❌ 微信笔记处理失败: {e}")
+            sys.exit(1)
+        print(f"\n{'='*50}\n✓ 微信笔记完成, 共处理 {count} 个产品")
+        return
 
     # process: 老入口, 自动化脚本用. 交互模式默认走合并流程, 不再需要用户手动 process
     if mode == "process":
