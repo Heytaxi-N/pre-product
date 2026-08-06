@@ -190,7 +190,11 @@ class CodeModeTests(unittest.TestCase):
                 captured["final"] = final
 
             with patch.object(pick_products, "download_product_images", fake_download), \
-                    patch.object(pick_products, "classify_images_ai", return_value=None), \
+                    patch.object(
+                        pick_products,
+                        "classify_images_ai",
+                        side_effect=AssertionError("默认流程不应调用图片分类 AI"),
+                    ), \
                     patch.object(pick_products, "wait_for_classify_review", fake_preview), \
                     patch.object(pick_products, "create_product_folder", fake_create):
                 count = pick_products.process_groups(

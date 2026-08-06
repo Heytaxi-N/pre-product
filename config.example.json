@@ -21,6 +21,7 @@
     "table_id": "",
     "status_field": "状态",
     "info_field": "信息",
+    "supplier_field": "相册供货商",
     "img_name_field": "图片名",
     "category_field": "分类",
     "category_child_prefix": "品牌分类-",

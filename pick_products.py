@@ -562,7 +562,7 @@ def _category_key(text):
 def build_feishu_category_options(categories=None, prefix="品牌分类-"):
     """按微店分类树生成飞书分类选项, 品牌子项加前缀并去重."""
     categories = categories or load_weidian_categories()
-    excluded = {"未分类", "店长推荐", "品牌分类"}
+    excluded = {"未分类", "品牌分类"}
     options = []
     seen = set()
     for row in categories:
@@ -585,69 +585,92 @@ def load_local_category_keywords(path=LOCAL_CATEGORY_KEYWORDS_FILE):
     }
 
 
-def _fallback_categories(text, categories, local_keywords=None):
-    source = _category_key(text)
-    matched = []
+def _classification_head(text):
+    """只取商品标题段, 避免把搭配说明当成商品种类."""
+    source = str(text or "").strip()
+    if not source:
+        return ""
+    return re.split(r"[\n\r，。；;|｜]", source, maxsplit=1)[0][:160]
+
+
+def _category_name(categories, prefix):
+    return next(
+        (row["name"] for row in categories
+         if row["name"].startswith(prefix)),
+        None,
+    )
+
+
+def _category_brand_aliases(name):
     aliases = {
-        "【特价区】买到赚到": ("特价", "折扣"),
-        "【上装】短袖/打底/外套等": ("上衣", "短袖", "打底", "外套", "冲锋衣", "夹克", "羽绒", "卫衣", "T恤"),
-        "【下装】各类长短内裤": ("裤", "裙", "内裤"),
-        "【鞋子】溯溪/跑山鞋/凉拖等": ("鞋", "凉拖", "拖鞋", "溯溪"),
-        "【配件】背包/帽子/袜子等": ("包", "背包", "帽", "袜", "腰带"),
-        "【男装】猛男点这里": ("男装", "男款", "男士"),
-        "【女装】美女看这里": ("女装", "女款", "女士"),
+        "始祖鸟": ("始祖鸟", "arcteryx", "arc'teryx", "鸟家"),
+        "北极狐FJALL": ("北极狐", "fjallraven", "fjall"),
     }
-    local_keywords = local_keywords if local_keywords is not None else load_local_category_keywords()
-    for name, words in local_keywords.items():
-        aliases[name] = tuple(dict.fromkeys((*aliases.get(name, ()), *words)))
-    for row in categories:
-        name = row["name"]
-        if name in ("未分类", "店长推荐", "品牌分类"):
-            continue
-        key = _category_key(name)
-        if key and (key in source or any(_category_key(term) in source for term in aliases.get(name, ()) )):
-            matched.append(name)
-    return matched
+    return aliases.get(name, (name,))
+
+
+def _fallback_categories(text, categories, local_keywords=None):
+    """按商品标题推断结构化分类; 品牌始终有可用兜底值."""
+    head = _classification_head(text)
+    selected = set()
+    kind_patterns = {
+        "【上装】": (
+            r"防晒衣|皮肤衣|冲锋衣|夹克|外套|羽绒|卫衣|t恤|短袖|长袖|衬衫|抓绒|软壳|"
+            r"风衣|棉服|马甲|背心|上衣",
+        ),
+        "【下装】": (r"长裤|短裤|裤子|裙子|半身裙|内裤",),
+        "【鞋子】": (r"登山鞋|溯溪鞋|跑山鞋|凉鞋|拖鞋|鞋子|鞋",),
+        "【配件】": (
+            r"双肩包|背包|腰包|斜挎包|胸包|帽子|棒球帽|渔夫帽|防晒帽|袜子|腰带|"
+            r"手套|围巾|水壶|水杯|眼镜",
+        ),
+    }
+    kind_hits = []
+    for prefix, patterns in kind_patterns.items():
+        score = sum(bool(re.search(pattern, head, re.I)) for pattern in patterns)
+        if score:
+            kind_hits.append((score, prefix))
+    if kind_hits:
+        _, kind_prefix = max(kind_hits, key=lambda item: item[0])
+        kind = _category_name(categories, kind_prefix)
+        if kind:
+            selected.add(kind)
+
+    gender = _category_name(categories, "【男装】")
+    female = _category_name(categories, "【女装】")
+    if re.search(r"男女同款|男装|男款|男士|男生|男性|猛男", head, re.I):
+        if gender:
+            selected.add(gender)
+    if re.search(r"男女同款|女装|女款|女士|女生|女性|女神|美女", head, re.I):
+        if female:
+            selected.add(female)
+
+    if re.search(r"特价|折扣|秒杀|清仓|处理价|促销|优惠", head, re.I):
+        sale = _category_name(categories, "【特价区】")
+        if sale:
+            selected.add(sale)
+
+    brand_root = next((row for row in categories if row["name"] == "品牌分类"), None)
+    brand_rows = [row for row in categories
+                  if brand_root and row.get("parent_id") == brand_root.get("cate_id")]
+    brand = next(
+        (row["name"] for row in brand_rows
+         if any(_category_key(alias) in _category_key(head)
+                for alias in _category_brand_aliases(row["name"]))),
+        None,
+    )
+    if not brand:
+        brand = next((row["name"] for row in brand_rows if "其他大牌" in row["name"]), None)
+    if brand:
+        selected.add(brand)
+
+    return [row["name"] for row in categories if row["name"] in selected]
 
 
 def match_weidian_categories(text, ai_config, categories=None):
-    """按文案语义从微店分类中多选, 并保留明确的文字命中."""
+    """按商品种类、性别、营销和品牌生成分类."""
     categories = categories or load_weidian_categories()
-    names = [row["name"] for row in categories
-             if row["name"] not in ("未分类", "店长推荐", "品牌分类")]
-    fallback = _fallback_categories(text, categories)
-    base_url = (ai_config or {}).get("base_url", "").rstrip("/")
-    api_key = (ai_config or {}).get("api_key", "")
-    if not (base_url and api_key and names):
-        return fallback
-    prompt = (
-        "根据商品文案,从给定的微店店铺分类中选择最符合的一个或多个分类。\n"
-        "只返回 JSON: {\"categories\":[\"分类名称\"]};不能返回列表之外的名称。\n"
-        "品牌商品通常选择品牌子分类,同时可选择最符合的品类分类;不要选择‘未分类’或‘店长推荐’,除非文案确实无法判断。\n"
-        f"候选分类: {json.dumps(names, ensure_ascii=False)}\n"
-        f"商品文案:\n{text}\n"
-    )
-    payload = {"model": (ai_config or {}).get("model", "qwen3-vl-flash"),
-               "max_tokens": 120,
-               "messages": [{"role": "user", "content": prompt}]}
-    try:
-        resp = http_post_json(f"{base_url}/chat/completions", payload,
-                              headers={"Authorization": f"Bearer {api_key}"})
-        answer = resp["choices"][0]["message"]["content"].strip()
-        start, end = answer.find("{"), answer.rfind("}")
-        data = json.loads(answer[start:end + 1]) if start >= 0 else {}
-        allowed = {_category_key(name): name for name in names}
-        result = []
-        for item in data.get("categories", []):
-            name = allowed.get(_category_key(item))
-            if name and name not in result and name not in ("未分类", "店长推荐"):
-                result.append(name)
-        selected = set(result) | set(fallback)
-        return [name for name in names if name in selected]
-    except Exception as e:
-        detail = "大模型额度/付费状态异常(HTTP 402)" if "HTTP Error 402" in str(e) else str(e)[:100]
-        print(f"  ⚠ 微店分类语义识别失败({detail}), 使用本地关键词命中")
-        return fallback
+    return _fallback_categories(text, categories)
 
 
 def load_weidian_models(path=WEIDIAN_MODELS_FILE):
@@ -673,6 +696,28 @@ def load_weidian_models(path=WEIDIAN_MODELS_FILE):
 
 def _model_value_key(value):
     return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _sort_model_values(group_name, values):
+    if not any(marker in group_name for marker in ("尺码", "鞋码", "码数")):
+        return list(values)
+    order = {
+        "均码": 0, "通码": 0, "自由码": 0,
+        "XXS": 1, "XS": 2, "S": 3, "M": 4, "L": 5, "XL": 6,
+    }
+
+    def key(item):
+        value = re.sub(r"\s+", "", str(item).upper())
+        if value in order:
+            return order[value]
+        match = re.fullmatch(r"(\d+)XL", value)
+        if match:
+            return 6 + int(match.group(1))
+        if re.fullmatch(r"\d+(?:\.\d+)?", value):
+            return 100 + float(value)
+        return 1000
+
+    return [value for _, value in sorted(enumerate(values), key=lambda item: (key(item[1]), item[0]))]
 
 
 def _explicit_color_alias(text, alias):
@@ -780,6 +825,7 @@ def _fallback_models(text, models):
                              if (match := re.search(re.escape(pattern), source, re.I))]
                 return min(positions) if positions else len(source)
             unique.sort(key=source_position)
+            unique = _sort_model_values(group["name"], unique)
             result.append({"name": group["name"], "values": unique})
     return result
 
@@ -871,6 +917,10 @@ def match_weidian_models(text, ai_config, models=None):
                     target["values"].append(value)
         matched = [by_name[_category_key(group["name"])] for group in models
                    if _category_key(group["name"]) in by_name]
+        matched = [
+            {**group, "values": _sort_model_values(group["name"], group["values"])}
+            for group in matched
+        ]
         return _add_hat_default_size(text, matched, models)
     except Exception as e:
         print(f"  ⚠ 微店型号识别失败, 使用白名单文字命中: {str(e)[:100]}")
@@ -879,7 +929,8 @@ def match_weidian_models(text, ai_config, models=None):
 
 def format_model_field(matches):
     return "\n".join(
-        f"{group['name']}：{'、'.join(group['values'])}" for group in matches if group["values"]
+        f"{group['name']}：{'、'.join(_sort_model_values(group['name'], group['values']))}"
+        for group in matches if group["values"]
     )
 
 
@@ -2035,6 +2086,7 @@ def process_groups(supplier_name, album_id, groups, progress, feishu, fs_cfg, ai
                         )
                         record_fields = {
                             fs_cfg.get("info_field", "信息"): pr["combined_text"],
+                            fs_cfg.get("supplier_field", "相册供货商"): supplier_name,
                             **auto_fields,
                         }
                         record_id = feishu.create_record(record_fields)
