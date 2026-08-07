@@ -1,5 +1,8 @@
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import pick_products
@@ -106,6 +109,101 @@ class AutoFieldTests(unittest.TestCase):
             result,
         )
 
+    def test_category_uses_safe_local_accessory_keyword(self):
+        result = pick_products.match_weidian_categories(
+            "始祖鸟邮差包", {}, pick_products.load_weidian_categories()
+        )
+        self.assertEqual(["【配件】背包/帽子/袜子等", "始祖鸟"], result)
+
+    def test_category_builtin_kind_keywords(self):
+        categories = pick_products.load_weidian_categories()
+        for text, expected in (
+            ("始祖鸟旅游包", "【配件】背包/帽子/袜子等"),
+            ("始祖鸟围脖", "【配件】背包/帽子/袜子等"),
+            ("始祖鸟长裙", "【下装】各类长短内裤"),
+            ("始祖鸟软壳裤", "【下装】各类长短内裤"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(expected, pick_products.match_weidian_categories(text, {}, categories)[0])
+
+    def test_category_gender_handles_compact_title_phrases(self):
+        categories = pick_products.load_weidian_categories()
+        self.assertIn(
+            "【男装】猛男点这里",
+            pick_products.match_weidian_categories("哈吉斯男防风夹克", {}, categories),
+        )
+        self.assertIn(
+            "【女装】美女看这里",
+            pick_products.match_weidian_categories("女防晒衣", {}, categories),
+        )
+
+    def test_category_reads_complete_information_field(self):
+        categories = pick_products.load_weidian_categories()
+        result = pick_products.match_weidian_categories(
+            "26080220\n颜色：黑色\nHazzys哈吉斯男防风拒水夹克", {}, categories
+        )
+        self.assertIn("【上装】短袖/打底/外套等", result)
+        self.assertIn("【男装】猛男点这里", result)
+        self.assertIn("哈吉斯", result)
+
+    def test_category_explicit_product_term_overrides_ai_kind(self):
+        categories = pick_products.load_weidian_categories()
+        response = {"choices": [{"message": {"content": json.dumps({
+            "product_subject": "软壳裤",
+            "kinds": ["【上装】短袖/打底/外套等"],
+            "genders": [],
+            "marketing": [],
+            "brand": "其他大牌←戳",
+            "is_bundle": False,
+            "evidence": {"【上装】短袖/打底/外套等": "软壳", "其他大牌←戳": ""},
+        }, ensure_ascii=False)}}]}
+        with patch.object(pick_products, "http_post_json", return_value=response):
+            result = pick_products.match_weidian_categories(
+                "新品软壳裤", {"base_url": "https://example.com", "api_key": "key",
+                              "category_decision_log": False}, categories
+            )
+        self.assertIn("【下装】各类长短内裤", result)
+        self.assertNotIn("【上装】短袖/打底/外套等", result)
+
+    def test_category_ai_can_select_multiple_kinds_for_bundle(self):
+        categories = pick_products.load_weidian_categories()
+        response = {"choices": [{"message": {"content": json.dumps({
+            "product_subject": "冲锋衣加软壳裤两件套",
+            "kinds": ["【上装】短袖/打底/外套等", "【下装】各类长短内裤"],
+            "genders": [],
+            "marketing": [],
+            "brand": "其他大牌←戳",
+            "is_bundle": True,
+            "evidence": {
+                "【上装】短袖/打底/外套等": "冲锋衣",
+                "【下装】各类长短内裤": "软壳裤",
+            },
+        }, ensure_ascii=False)}}]}
+        with patch.object(pick_products, "http_post_json", return_value=response):
+            result = pick_products.match_weidian_categories(
+                "冲锋衣加软壳裤两件套", {"base_url": "https://example.com", "api_key": "key",
+                                        "category_decision_log": False}, categories
+            )
+        self.assertIn("【上装】短袖/打底/外套等", result)
+        self.assertIn("【下装】各类长短内裤", result)
+
+    def test_category_ai_retries_then_logs_rule_fallback(self):
+        categories = pick_products.load_weidian_categories()
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(pick_products, "http_post_json", side_effect=OSError("timeout")) as post, \
+                patch.object(pick_products.time, "sleep"):
+            log_file = Path(root) / "category_decisions.jsonl"
+            result = pick_products.match_weidian_categories(
+                "始祖鸟男款冲锋衣",
+                {"base_url": "https://example.com", "api_key": "key",
+                 "category_decision_log_file": str(log_file)},
+                categories,
+            )
+            record = json.loads(log_file.read_text().strip())
+        self.assertEqual(3, post.call_count)
+        self.assertTrue(record["used_rule_fallback"])
+        self.assertEqual(result, record["final_categories"])
+
     def test_ai_categories_keep_explicit_text_matches(self):
         categories = pick_products.load_weidian_categories()
         response = {"choices": [{"message": {"content": '{"categories":["其他大牌←戳"]}'}}]}
@@ -209,13 +307,34 @@ class AutoFieldTests(unittest.TestCase):
 
     def test_build_auto_fields_filters_missing_feishu_options(self):
         fields, _, _ = pick_products.build_auto_fields(
+            "始祖鸟 男款冲锋衣 💰40", {}, {},
+            {"【上装】短袖/打底/外套等", "品牌分类-始祖鸟"},
+        )
+        self.assertEqual(
+            ["【上装】短袖/打底/外套等", "品牌分类-始祖鸟"],
+            fields["分类"],
+        )
+
+    def test_build_auto_fields_allows_unknown_kind(self):
+        fields, _, _ = pick_products.build_auto_fields(
             "始祖鸟 男款冲锋衣 💰40", {}, {}, {"品牌分类-始祖鸟"}
         )
         self.assertEqual(["品牌分类-始祖鸟"], fields["分类"])
 
+    def test_category_allows_unknown_kind(self):
+        self.assertEqual(
+            ["【男装】猛男点这里", "始祖鸟"],
+            pick_products.match_weidian_categories(
+                "始祖鸟 男款", {}, pick_products.load_weidian_categories()
+            ),
+        )
+
     def test_mines_recent_feishu_copy_into_local_keywords(self):
         now = int(time.time() * 1000)
-        categories = [{"name": "上装", "parent_id": 0}]
+        categories = [
+            {"name": "上装", "parent_id": 0},
+            {"name": "下装", "parent_id": 0},
+        ]
         records = [
             {"fields": {"创建时间": now, "信息": "轻量软壳冲锋衣", "分类": ["上装"]}},
             {"fields": {"创建时间": now, "信息": "黑色软壳外套",
@@ -231,7 +350,7 @@ class AutoFieldTests(unittest.TestCase):
         self.assertIn("软壳", keywords["上装"])
         self.assertNotIn("羽绒", keywords["上装"])
         self.assertNotIn("户外", keywords["上装"])
-        self.assertNotIn("户外", keywords["下装"])
+        self.assertNotIn("户外", keywords.get("下装", []))
 
 
 if __name__ == "__main__":

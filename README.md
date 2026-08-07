@@ -13,11 +13,11 @@
    原图片分类函数仍保留在代码中作为独立旧能力,但默认流程不调用;以后需要恢复时再接回处理阶段。
 6. **顺序预览(拖拽/删图)** — 自动弹出「排序预览.html」:图片按当前条目顺序铺开,**拖动**任意调序、Command 单击多选、Shift 单击连选、点 **×** 删掉不要的(不存本地)、尺码表点「尺码表」按钮标上(视频显示为 🎬)。点「完成并生成」→ 下载 `分类确认.json`,脚本自动接住按你的顺序建文件夹。`run` 自动化模式不弹;设 `SKIP_REVIEW=1` 可跳过。
 7. **写飞书** — 合并后的文案写入多维表格「信息」字段,并自动填写:
-   - **分类**: 根据文案语义从微店分类接口缓存 `data/weidian_categories.json` 中匹配,可多选;写入前会按飞书「分类」字段已有选项过滤。品牌分类使用 `品牌分类-品牌名` 的选项格式。
+   - **分类**: 只读取飞书完整「信息」文字,由明确商品词优先、AI 语义补充;种类通常单选,仅明确套装可同时选上下装,品牌必选且性别未写则不选。结果只允许使用 `data/weidian_categories.json` 中的分类,写入前还会按飞书「分类」字段已有选项过滤。品牌分类使用 `品牌分类-品牌名` 的选项格式。
    - **成本价**: 识别文案中 `💰40`、`P35` 或 `p35` 形式的金额。
    - **售价**: 成本价上浮 20%,同时保证利润至少 15 元;向上取整到个位数 8(如成本价 40,售价 58)。
    - **型号**: 根据文案从微店型号白名单 `data/weidian_models.json` 中识别,没有匹配就留空,不会编造。颜色可归并到基础色(如玫瑰红→红色),每个型号分类单独一行,具体规格用顿号分隔,例如 `颜色：红色、黑色`、`尺码2：M、L、XL`。
-   文案分类接口为 `https://thor.weidian.com/wditem/cateInfo.list/1.0`,型号接口为 `https://thor.weidian.com/wditem/item.getAllAttrList/1.0`;分类或型号变更后需更新本地缓存文件。分类和型号 AI 调用失败时会回退到白名单中的明确文字匹配,没有可靠匹配则留空。飞书自动化仍会据「信息」生成「图片名」。
+   文案分类接口为 `https://thor.weidian.com/wditem/cateInfo.list/1.0`,型号接口为 `https://thor.weidian.com/wditem/item.getAllAttrList/1.0`;分类或型号变更后需更新本地缓存文件。分类 AI 最多重试 3 次,失败后回退到白名单中的明确文字匹配并继续;分类判断记录写入 `data/category_decisions.jsonl`。飞书自动化仍会据「信息」生成「图片名」。
 8. **建文件夹** — 以图片名建文件夹,图片按 `图片名+序号` 命名(如 `凯速干裤01.jpg`);尺码表命名为 `尺码表`,视频命名为 `视频01`。文案已入飞书,文件夹里不再另存 `文案.txt`。
 
 ## 一次性配置(只做一次)
@@ -43,6 +43,49 @@ python3 pick_products.py refresh_keywords
 ```
 
 该命令只读取飞书「信息」和「分类」字段,按已有分类统计重复出现的中文词,写入 `data/local_category_keywords.json`;本地已有关键词优先保留,不会修改飞书记录。
+
+### 已确认的微店接口
+
+供货商查询接口:
+
+```text
+POST https://thor.weidian.com/retailcore/supply.paging/1.0
+Content-Type: application/x-www-form-urlencoded
+
+param={"pageNo":1,"pageSize":100,"SearchCondition":{"supplierCode":"","supplierName":""}}
+```
+
+下游创建商品后绑定供货商使用两个接口。两个请求都使用当前登录会话的 `wdtoken`:
+
+```text
+POST https://thor.weidian.com/retailcore/supply.linkItem/1.0
+param={"supplyPartnerId":8295,"itemId":7768727045}
+wdtoken=<当前登录会话中的 wdtoken>
+
+POST https://thor.weidian.com/retailcore/supply.itemPartnerInfo/1.0
+param={"itemId":7768727045}
+wdtoken=<当前登录会话中的 wdtoken>
+```
+
+绑定成功不能只看 HTTP 状态:必须调用 `supply.itemPartnerInfo` 回读,并核对返回的供货商 ID 或名称。供货商名称到微店 ID 的映射放在下游项目的 `supplier_mapping.json`，格式为:
+
+```text
+{
+  "昕包外贸": {
+    "weidian_name": "甜心",
+    "weidian_id": 8336
+  }
+}
+```
+
+分类和型号接口目前只作为读取接口使用:
+
+```text
+https://thor.weidian.com/wditem/cateInfo.list/1.0
+https://thor.weidian.com/wditem/item.getAllAttrList/1.0
+```
+
+目前没有已验证的微店型号写入接口；不要把猜测的 `itemWrite.updateAttrList` 当作写入依据。
 
 如果飞书「分类」字段选项不完整,可按微店分类缓存补全并去重:
 

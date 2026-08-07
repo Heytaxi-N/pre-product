@@ -8,7 +8,9 @@
   "ai_vision": {
     "base_url": "https://token.xiaorongtech.com/v1",
     "api_key": "",
-    "model": "qwen3-vl-flash"
+    "model": "qwen3-vl-flash",
+    "category_decision_log": true,
+    "category_decision_log_file": "data/category_decisions.jsonl"
   },
   "folder_template": "{img_name}",
   "defaults": {

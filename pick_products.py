@@ -19,6 +19,7 @@ FEISHU_PENDING_FILE = SCRIPT_DIR / "feishu_pending.json"
 WEIDIAN_CATEGORIES_FILE = SCRIPT_DIR / "data" / "weidian_categories.json"
 WEIDIAN_MODELS_FILE = SCRIPT_DIR / "data" / "weidian_models.json"
 LOCAL_CATEGORY_KEYWORDS_FILE = SCRIPT_DIR / "data" / "local_category_keywords.json"
+CATEGORY_DECISIONS_FILE = SCRIPT_DIR / "data" / "category_decisions.jsonl"
 OUTPUT_DIR = Path("/Users/nick/Downloads/weidian_products-main/商品图")
 WECHAT_NOTE_TEMP_ROOT = Path(
     "/Users/nick/Library/Containers/com.tencent.xinWeiXin2/Data/Documents/xwechat_files"
@@ -29,6 +30,7 @@ BOOKMARKLET_FILE = SCRIPT_DIR / "install_bookmark.html"
 CHROME_EXTENSION_DIR = SCRIPT_DIR / "chrome-extension"
 GROUP_TIME_GAP = 120  # 秒: 帖子时间间隔 < 此值归为同一产品
 _PROGRESS_LOCK = threading.Lock()
+_CATEGORY_LOG_LOCK = threading.Lock()
 
 
 def _project_data_dir():
@@ -585,20 +587,25 @@ def load_local_category_keywords(path=LOCAL_CATEGORY_KEYWORDS_FILE):
     }
 
 
-def _classification_head(text):
-    """只取商品标题段, 避免把搭配说明当成商品种类."""
-    source = str(text or "").strip()
-    if not source:
-        return ""
-    return re.split(r"[\n\r，。；;|｜]", source, maxsplit=1)[0][:160]
-
-
 def _category_name(categories, prefix):
     return next(
         (row["name"] for row in categories
          if row["name"].startswith(prefix)),
         None,
     )
+
+
+_CATEGORY_KIND_PREFIXES = ("【上装】", "【下装】", "【配件】", "【鞋子】")
+
+
+def _validate_kind_selection(categories, selected, allow_multiple=False):
+    kind_names = {
+        row["name"] for row in categories
+        if any(row["name"].startswith(prefix) for prefix in _CATEGORY_KIND_PREFIXES)
+    }
+    matched = [name for name in selected if name in kind_names]
+    if len(matched) > 1 and not allow_multiple:
+        raise RuntimeError("分类最多只能选择一个种类：上装、下装、配件或鞋")
 
 
 def _category_brand_aliases(name):
@@ -609,68 +616,353 @@ def _category_brand_aliases(name):
     return aliases.get(name, (name,))
 
 
-def _fallback_categories(text, categories, local_keywords=None):
-    """按商品标题推断结构化分类; 品牌始终有可用兜底值."""
-    head = _classification_head(text)
+def _regex_evidence(source, patterns):
+    matches = [
+        match
+        for pattern in set(patterns)
+        if (match := re.search(pattern, source, re.I))
+    ]
+    return max(matches, key=lambda match: (len(match.group(0)), -match.start()), default=None)
+
+
+def _alias_position(source, alias):
+    alias = str(alias or "").strip()
+    if not alias:
+        return -1
+    if re.fullmatch(r"[A-Za-z0-9-]+", alias):
+        match = re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])",
+            source,
+            re.I,
+        )
+        return match.start() if match else -1
+    return _category_key(source).find(_category_key(alias))
+
+
+def _rule_category_decision(text, categories, local_keywords=None):
+    """从完整信息字段提取高置信规则分类和原文证据."""
+    source = str(text or "").strip()
+    local_keywords = local_keywords if local_keywords is not None else load_local_category_keywords()
+
+    def safe_local_terms(prefix):
+        return tuple(
+            re.escape(word)
+            for name, words in local_keywords.items()
+            if name.startswith(prefix)
+            for word in words
+            if len(_category_key(word)) >= 2
+        )
+
+    def safe_local_aliases(name):
+        return tuple(
+            word
+            for category, words in local_keywords.items()
+            if category == name
+            for word in words
+            if len(_category_key(word)) >= 2
+        )
+
     selected = set()
+    evidence = {}
     kind_patterns = {
         "【上装】": (
             r"防晒衣|皮肤衣|冲锋衣|夹克|外套|羽绒|卫衣|t恤|短袖|长袖|衬衫|抓绒|软壳|"
             r"风衣|棉服|马甲|背心|上衣",
         ),
-        "【下装】": (r"长裤|短裤|裤子|裙子|半身裙|内裤",),
+        "【下装】": (r"长裤|短裤|裤子|裙子|长裙|半身裙|工装裤|软壳裤|内裤",),
         "【鞋子】": (r"登山鞋|溯溪鞋|跑山鞋|凉鞋|拖鞋|鞋子|鞋",),
         "【配件】": (
-            r"双肩包|背包|腰包|斜挎包|胸包|帽子|棒球帽|渔夫帽|防晒帽|袜子|腰带|"
-            r"手套|围巾|水壶|水杯|眼镜",
+            r"双肩包|旅游包|背包|挎包|肩包|腰包|斜挎包|胸包|帽子|冷帽|棒球帽|渔夫帽|防晒帽|"
+            r"袜子|腰带|手套|围脖|围巾|面罩|水壶|水杯|杯子|眼镜",
         ),
+    }
+    kind_patterns = {
+        prefix: (*patterns, *safe_local_terms(prefix))
+        for prefix, patterns in kind_patterns.items()
     }
     kind_hits = []
     for prefix, patterns in kind_patterns.items():
-        score = sum(bool(re.search(pattern, head, re.I)) for pattern in patterns)
-        if score:
-            kind_hits.append((score, prefix))
+        match = _regex_evidence(source, patterns)
+        if match:
+            kind_hits.append((len(match.group(0)), -match.start(), prefix, match.group(0)))
     if kind_hits:
-        _, kind_prefix = max(kind_hits, key=lambda item: item[0])
+        _, _, kind_prefix, term = max(kind_hits)
         kind = _category_name(categories, kind_prefix)
         if kind:
             selected.add(kind)
+            evidence[kind] = term
 
-    gender = _category_name(categories, "【男装】")
+    male = _category_name(categories, "【男装】")
     female = _category_name(categories, "【女装】")
-    if re.search(r"男女同款|男装|男款|男士|男生|男性|猛男", head, re.I):
-        if gender:
-            selected.add(gender)
-    if re.search(r"男女同款|女装|女款|女士|女生|女性|女神|美女", head, re.I):
-        if female:
-            selected.add(female)
+    unisex = re.search(r"男女同款|男女款|男女通用|中性款?|情侣款|情侣装", source, re.I)
+    male_match = re.search(
+        r"男装|男款|男士|男性|猛男|男孩|"
+        r"男(?=防|款|装|士|生|性|同款|版|式|裤|衣|外套|短袖|夹克|冲锋衣)",
+        source, re.I,
+    )
+    female_match = re.search(
+        r"女装|女款|女士|女性|女神|美女|女孩|"
+        r"女(?=防|款|装|士|生|性|同款|版|式|裤|衣|外套|短袖|夹克|冲锋衣)",
+        source, re.I,
+    )
+    if unisex:
+        for name in (male, female):
+            if name:
+                selected.add(name)
+                evidence[name] = unisex.group(0)
+    else:
+        first_gender = min(
+            ((match.start(), name, match.group(0))
+             for name, match in ((male, male_match), (female, female_match))
+             if name and match),
+            default=None,
+        )
+        if first_gender:
+            _, name, term = first_gender
+            selected.add(name)
+            evidence[name] = term
 
-    if re.search(r"特价|折扣|秒杀|清仓|处理价|促销|优惠", head, re.I):
-        sale = _category_name(categories, "【特价区】")
-        if sale:
-            selected.add(sale)
+    manager = _category_name(categories, "店长推荐")
+    manager_terms = ("店长推荐", *(local_keywords.get(manager, ()) if manager else ()))
+    manager_match = _regex_evidence(source, tuple(re.escape(term) for term in manager_terms if term))
+    if manager and manager_match:
+        selected.add(manager)
+        evidence[manager] = manager_match.group(0)
+
+    sale = _category_name(categories, "【特价区】")
+    sale_terms = (
+        "特价", "折扣", "秒杀", "清仓", "处理价", "促销", "优惠", "赔钱",
+        *(local_keywords.get(sale, ()) if sale else ()),
+    )
+    sale_match = _regex_evidence(source, tuple(re.escape(term) for term in sale_terms if term))
+    if sale and sale_match:
+        selected.add(sale)
+        evidence[sale] = sale_match.group(0)
 
     brand_root = next((row for row in categories if row["name"] == "品牌分类"), None)
     brand_rows = [row for row in categories
                   if brand_root and row.get("parent_id") == brand_root.get("cate_id")]
-    brand = next(
-        (row["name"] for row in brand_rows
-         if any(_category_key(alias) in _category_key(head)
-                for alias in _category_brand_aliases(row["name"]))),
-        None,
-    )
+    brand_hits = []
+    for order, row in enumerate(brand_rows):
+        for alias in dict.fromkeys((*_category_brand_aliases(row["name"]),
+                                    *safe_local_aliases(row["name"]))):
+            position = _alias_position(source, alias)
+            if position >= 0:
+                brand_hits.append((position, order, row["name"], alias))
+    brand = None
+    if brand_hits:
+        _, _, brand, term = min(brand_hits)
+        evidence[brand] = term
     if not brand:
         brand = next((row["name"] for row in brand_rows if "其他大牌" in row["name"]), None)
     if brand:
         selected.add(brand)
 
-    return [row["name"] for row in categories if row["name"] in selected]
+    result = [row["name"] for row in categories if row["name"] in selected]
+    _validate_kind_selection(categories, result)
+    kind_names = {name for name in result
+                  if any(name.startswith(prefix) for prefix in _CATEGORY_KIND_PREFIXES)}
+    gender_names = {name for name in (male, female) if name}
+    marketing_names = {name for name in (manager, sale) if name}
+    return {
+        "categories": result,
+        "kinds": [name for name in result if name in kind_names],
+        "genders": [name for name in result if name in gender_names],
+        "marketing": [name for name in result if name in marketing_names],
+        "brand": brand,
+        "evidence": evidence,
+    }
+
+
+def _fallback_categories(text, categories, local_keywords=None):
+    return _rule_category_decision(text, categories, local_keywords)["categories"]
+
+
+def _parse_json_object(answer):
+    start, end = str(answer or "").find("{"), str(answer or "").rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("AI 未返回 JSON 对象")
+    value = json.loads(str(answer)[start:end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("AI 分类结果不是 JSON 对象")
+    return value
+
+
+def _category_ai_prompt(text, categories, local_keywords):
+    kinds = [row["name"] for row in categories
+             if any(row["name"].startswith(prefix) for prefix in _CATEGORY_KIND_PREFIXES)]
+    genders = [name for prefix in ("【男装】", "【女装】")
+               if (name := _category_name(categories, prefix))]
+    marketing = [name for prefix in ("店长推荐", "【特价区】")
+                 if (name := _category_name(categories, prefix))]
+    brand_root = next((row for row in categories if row["name"] == "品牌分类"), None)
+    brands = [row["name"] for row in categories
+              if brand_root and row.get("parent_id") == brand_root.get("cate_id")]
+    safe_keywords = {
+        name: [word for word in words if len(_category_key(word)) >= 2]
+        for name, words in local_keywords.items()
+        if any(len(_category_key(word)) >= 2 for word in words)
+    }
+    return (
+        "你是商品分类器，只能依据下面完整商品文字，禁止看图或猜测未写明的信息。\n"
+        "先识别实际售卖的主商品，忽略搭配建议、使用场景和顺带提到的其它商品。\n"
+        "种类通常只能选一个；只有文字明确表示套装/组合实际同时售卖多个种类时才能多选。\n"
+        "性别只按文字：男款选男装，女款选女装，男女同款/中性/情侣款同时选；完全没写则返回空数组。"
+        "明确的男款/女款优先于‘女生也能穿、男生也能穿’等陪衬描述。\n"
+        "品牌只选一个，按文字中最先出现的候选品牌；平替、同款、媲美也算命中；识别不到选其他大牌。\n"
+        "店长推荐、高品质、原厂可选店长推荐；特价、折扣、秒杀、清仓、处理价、促销、优惠、赔钱可选特价。\n"
+        "每个选择都必须在 evidence 中给出完整文字里的原文短句；没有原文证据不得选择。\n"
+        "只返回 JSON，不要解释："
+        "{\"product_subject\":\"原文中的主商品短句\",\"kinds\":[\"分类全名\"],"
+        "\"genders\":[\"分类全名\"],\"marketing\":[\"分类全名\"],"
+        "\"brand\":\"品牌分类全名\",\"is_bundle\":false,"
+        "\"evidence\":{\"分类全名\":\"原文短句\"}}\n"
+        f"种类候选: {json.dumps(kinds, ensure_ascii=False)}\n"
+        f"性别候选: {json.dumps(genders, ensure_ascii=False)}\n"
+        f"营销候选: {json.dumps(marketing, ensure_ascii=False)}\n"
+        f"品牌候选: {json.dumps(brands, ensure_ascii=False)}\n"
+        f"补充关键词: {json.dumps(safe_keywords, ensure_ascii=False)}\n"
+        f"完整商品文字:\n{text}"
+    )
+
+
+def _call_category_ai(text, ai_config, categories, local_keywords):
+    base_url = (ai_config or {}).get("base_url", "").rstrip("/")
+    api_key = (ai_config or {}).get("api_key", "")
+    if not (base_url and api_key):
+        return None, "未配置 AI"
+    payload = {
+        "model": (ai_config or {}).get("model", "qwen3-vl-flash"),
+        "max_tokens": 600,
+        "messages": [{"role": "user", "content": _category_ai_prompt(
+            text, categories, local_keywords
+        )}],
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = http_post_json(
+                f"{base_url}/chat/completions",
+                payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            answer = response["choices"][0]["message"]["content"]
+            return _parse_json_object(answer), None
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep((attempt + 1) * 0.8)
+    return None, str(last_error)[:200]
+
+
+def _normalize_ai_category_decision(data, text, categories):
+    if not isinstance(data, dict):
+        return {"kinds": [], "genders": [], "marketing": [], "brand": None,
+                "product_subject": "", "is_bundle": False, "evidence": {}}
+    all_names = {row["name"] for row in categories}
+    kind_names = {name for name in all_names
+                  if any(name.startswith(prefix) for prefix in _CATEGORY_KIND_PREFIXES)}
+    gender_names = {name for prefix in ("【男装】", "【女装】")
+                    if (name := _category_name(categories, prefix))}
+    marketing_names = {name for prefix in ("店长推荐", "【特价区】")
+                       if (name := _category_name(categories, prefix))}
+    brand_root = next((row for row in categories if row["name"] == "品牌分类"), None)
+    brand_names = {row["name"] for row in categories
+                   if brand_root and row.get("parent_id") == brand_root.get("cate_id")}
+    evidence = {}
+    for name, quote in (data.get("evidence") or {}).items():
+        quote = str(quote or "").strip()
+        if name in all_names and quote and _category_key(quote) in _category_key(text):
+            evidence[name] = quote
+
+    def valid_values(key, allowed):
+        return [name for name in data.get(key, [])
+                if name in allowed and name in evidence]
+
+    subject = str(data.get("product_subject") or "").strip()
+    if not subject or _category_key(subject) not in _category_key(text):
+        subject = ""
+    brand = data.get("brand") if data.get("brand") in brand_names else None
+    other_brand = next((name for name in brand_names if "其他大牌" in name), None)
+    if brand != other_brand and brand not in evidence:
+        brand = None
+    genders = valid_values("genders", gender_names)
+    genders = [name for name in genders
+               if re.search(r"男|女|中性|情侣|老公|老婆|先生|太太", evidence[name])]
+    return {
+        "kinds": valid_values("kinds", kind_names),
+        "genders": genders,
+        "marketing": valid_values("marketing", marketing_names),
+        "brand": brand,
+        "product_subject": subject,
+        "is_bundle": data.get("is_bundle") is True,
+        "evidence": evidence,
+    }
+
+
+def _append_category_decision(record, path=None):
+    target = Path(path or CATEGORY_DECISIONS_FILE)
+    if not target.is_absolute():
+        target = SCRIPT_DIR / target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _CATEGORY_LOG_LOCK, target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def match_weidian_categories(text, ai_config, categories=None):
-    """按商品种类、性别、营销和品牌生成分类."""
+    """完整文字规则优先, AI 补齐语义, 输出微店分类白名单."""
     categories = categories or load_weidian_categories()
-    return _fallback_categories(text, categories)
+    local_keywords = load_local_category_keywords()
+    rules = _rule_category_decision(text, categories, local_keywords)
+    ai_raw, ai_error = _call_category_ai(text, ai_config, categories, local_keywords)
+    ai = _normalize_ai_category_decision(ai_raw, text, categories)
+    subject_rules = (
+        _rule_category_decision(ai["product_subject"], categories, local_keywords)
+        if ai["product_subject"] else None
+    )
+
+    kinds = (
+        ai["kinds"]
+        if ai["is_bundle"] and len(ai["kinds"]) > 1
+        else (subject_rules or {}).get("kinds") or ai["kinds"] or rules["kinds"]
+    )
+    if len(kinds) > 1 and not ai["is_bundle"]:
+        kinds = kinds[:1]
+    genders = rules["genders"] or ai["genders"]
+    marketing = rules["marketing"]
+    brand = rules["brand"]
+    if brand and "其他大牌" in brand and ai["brand"]:
+        brand = ai["brand"]
+
+    selected = set((*kinds, *genders, *marketing, *((brand,) if brand else ())))
+    result = [row["name"] for row in categories if row["name"] in selected]
+    _validate_kind_selection(categories, result, allow_multiple=ai["is_bundle"])
+
+    final_evidence = {}
+    for name in result:
+        final_evidence[name] = (
+            (subject_rules or {}).get("evidence", {}).get(name)
+            or rules["evidence"].get(name)
+            or ai["evidence"].get(name)
+            or ""
+        )
+    should_log = (ai_config or {}).get(
+        "category_decision_log", bool((ai_config or {}).get("base_url") or
+                                      (ai_config or {}).get("api_key"))
+    )
+    if should_log:
+        _append_category_decision({
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "text_hash": hashlib.sha256(str(text or "").encode()).hexdigest()[:16],
+            "text": str(text or ""),
+            "rules": rules,
+            "ai": ai_raw,
+            "ai_error": ai_error,
+            "used_rule_fallback": ai_raw is None,
+            "final_categories": result,
+            "final_evidence": final_evidence,
+        }, (ai_config or {}).get("category_decision_log_file"))
+    return result
 
 
 def load_weidian_models(path=WEIDIAN_MODELS_FILE):
@@ -969,6 +1261,7 @@ def build_auto_fields(text, ai_config, fs_config, category_options=None):
         ]
         if category_options is not None:
             formatted = [name for name in formatted if name in category_options]
+        _validate_kind_selection(all_categories, formatted, allow_multiple=True)
         if formatted:
             fields[fs_config.get("category_field", "分类")] = formatted
     cost = parse_cost_price(text)
@@ -1182,7 +1475,7 @@ def sync_category_field_options(feishu, fs_config):
 
 _KEYWORD_STOPWORDS = {
     "商品", "新款", "现货", "上新", "专柜", "正品", "男女", "均码", "图片", "颜色",
-    "尺码", "发货", "到货", "推荐", "下单", "链接", "质量", "面料", "细节", "同款",
+    "尺码", "发货", "到货", "推荐", "下单", "链接", "质量", "面料", "细节", "同款", "户外",
 }
 
 
